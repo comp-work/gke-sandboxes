@@ -1,5 +1,12 @@
 import { afterAll, expect, test } from 'bun:test';
-import { GkeSandboxes, KubernetesApi, KubernetesApiError, sandboxState } from './index.ts';
+import {
+  CheckpointReleaseError,
+  GkeSandboxes,
+  KubernetesApi,
+  KubernetesApiError,
+  sandboxState,
+  type SandboxEvent,
+} from './index.ts';
 
 // The sleep, wake and recovery rules, against a stand-in for the Kubernetes API. Ported from the
 // tests of Energy's dispatcher, which this library was extracted from.
@@ -192,7 +199,7 @@ const cluster = (options: { drainStatus: 0 | 3; restores: boolean }) => {
         annotations: input.metadata.annotations ?? {},
         uid: crypto.randomUUID(),
         resourceVersion: String(++version),
-        creationTimestamp: new Date(version).toISOString(),
+        creationTimestamp: new Date(kind === 'podsnapshots' ? Date.now() : version).toISOString(),
       },
       status: {},
     };
@@ -260,12 +267,16 @@ const cluster = (options: { drainStatus: 0 | 3; restores: boolean }) => {
       ...answers,
     });
   // A backend's client. Its service is asked whether it still has work before a sandbox sleeps.
-  const backend = (api: Partial<Pick<KubernetesApi, 'request' | 'exec'>> = {}) =>
+  const backend = (
+    api: Partial<Pick<KubernetesApi, 'request' | 'exec'>> = {},
+    onOperation?: (event: SandboxEvent) => void,
+  ) =>
     new GkeSandboxes(client(api), {
       namespace: 'sandboxes',
       image: 'registry/sandbox:1',
       serviceAccount: 'sandbox',
       drain: async (sandbox) => (await sandbox.process.executeCommand('drain-idle')).exitCode !== 3,
+      onOperation,
     });
   const sandboxes = backend();
   // A sandbox's pod has its own name, which changes with every wake.
@@ -667,3 +678,161 @@ test('a snapshot that GKE could not take leaves the sandbox running', async () =
   expect(kinds.podsnapshotmanualtriggers!.size).toBe(0);
   expect(await stateOf(sandboxes)).toBe('started');
 });
+
+const checkpointOptions = { intervalMs: 600_000 };
+
+test('checkpoints when the sandbox or its latest snapshot is old enough', async () => {
+  const { sandboxes, pod, kinds } = cluster({ drainStatus: 0, restores: true });
+  await sandboxes.acquire(ID, signal);
+  expect((await sandboxes.checkpointDue(checkpointOptions)).attempted).toBe(0);
+
+  pod(ID).metadata.labels['energy-created-ms'] = '1';
+  expect((await sandboxes.checkpointDue(checkpointOptions)).succeeded).toBe(1);
+  expect((await sandboxes.checkpointDue(checkpointOptions)).attempted).toBe(0);
+
+  const [first] = kinds.podsnapshots!.values();
+  first!.metadata.creationTimestamp = new Date(0).toISOString();
+  expect((await sandboxes.checkpointDue(checkpointOptions)).succeeded).toBe(1);
+  expect(kinds.podsnapshots!.size).toBe(1);
+  expect(kinds.podsnapshots!.has(first!.metadata.name)).toBe(false);
+});
+
+test('reports per-sandbox failures and continues checkpointing', async () => {
+  const { sandboxes, backend, pod, request } = cluster({ drainStatus: 0, restores: true });
+  for (const [index, id] of ['healthy', 'release', 'claim', 'lookup'].entries()) {
+    await sandboxes.acquire(id, signal);
+    pod(id).metadata.labels['energy-created-ms'] = String(index + 1);
+  }
+  const lookup = new KubernetesApiError(503, 'Pod lookup unavailable');
+  const claim = new KubernetesApiError(403, 'Claim denied');
+  const release = new KubernetesApiError(403, 'Release denied');
+  const events: SandboxEvent[] = [];
+  const maintainer = backend(
+    {
+      request: async (method, path, body) => {
+        if (method === 'GET' && path.includes('/pods?') && path.includes('energy-sandbox%3Dlookup'))
+          throw lookup;
+        if (method === 'PATCH' && path.endsWith(`/${pod('claim').metadata.name}`)) throw claim;
+        if (
+          method === 'PATCH' &&
+          path.endsWith(`/${pod('release').metadata.name}`) &&
+          !Array.isArray(body)
+        )
+          throw release;
+        return request(method, path, body);
+      },
+    },
+    (event) => events.push(event),
+  );
+
+  const result = await maintainer.checkpointDue({ ...checkpointOptions, concurrency: 1 });
+  const [snapshot] = (await sandboxes.find('release'))!.snapshots;
+  expect(snapshot).toBeDefined();
+  const [releaseEvent, successEvent] = events;
+  expect(events).toHaveLength(2);
+  expect(releaseEvent!.outcome).toBe('failed');
+  expect(successEvent!.outcome).toBe('succeeded');
+  expect(releaseEvent!.error).toBeInstanceOf(CheckpointReleaseError);
+  expect(releaseEvent!.error).toMatchObject({ snapshot, cause: release });
+  expect(result).toEqual({
+    attempted: 4,
+    succeeded: 1,
+    skipped: 0,
+    failed: [
+      { sandboxId: 'lookup', error: lookup },
+      { sandboxId: 'claim', error: claim },
+      { sandboxId: 'release', error: releaseEvent!.error },
+    ],
+  });
+});
+
+test('two backends checkpoint the same due sandbox once', async () => {
+  const { sandboxes, backend, pod } = cluster({ drainStatus: 0, restores: true });
+  await sandboxes.acquire(ID, signal);
+  pod(ID).metadata.labels['energy-created-ms'] = '1';
+  const results = await Promise.all([
+    sandboxes.checkpointDue(checkpointOptions),
+    backend().checkpointDue(checkpointOptions),
+  ]);
+  expect(results.map(({ succeeded }) => succeeded).sort()).toEqual([0, 1]);
+  expect(results.map(({ skipped }) => skipped).sort()).toEqual([0, 1]);
+});
+
+test('skips checkpoints for held, terminating, pending and sleeping sandboxes', async () => {
+  const { sandboxes, pod, sleep } = cluster({ drainStatus: 0, restores: true });
+  for (const id of ['held', 'terminating', 'pending', 'asleep']) {
+    await sandboxes.acquire(id, signal);
+    pod(id).metadata.labels['energy-created-ms'] = '1';
+  }
+  await sleep('asleep');
+  pod('held').metadata.annotations['getenergy.com/sleeping-ms'] = String(Date.now());
+  pod('terminating').metadata.deletionTimestamp = 'now';
+  pod('pending').status.phase = 'Pending';
+
+  expect((await sandboxes.checkpointDue(checkpointOptions)).attempted).toBe(0);
+});
+
+test('a slow checkpoint leaves room for other sandboxes and is retried if it fails', async () => {
+  const { sandboxes, backend, pod, kinds, request } = cluster({ drainStatus: 0, restores: true });
+  for (const id of ['one', 'two', 'three']) {
+    await sandboxes.acquire(id, signal);
+    pod(id).metadata.labels['energy-created-ms'] = '1';
+  }
+  const release = Promise.withResolvers<void>();
+  let attempts = 0;
+  let active = 0;
+  let peak = 0;
+  const maintainer = backend({
+    request: async (method, path, body) => {
+      if (method !== 'POST' || !path.endsWith('/podsnapshotmanualtriggers'))
+        return request(method, path, body);
+      peak = Math.max(peak, ++active);
+      try {
+        if (++attempts === 1) {
+          await release.promise;
+          throw new Error('snapshot unavailable');
+        }
+        return await request(method, path, body);
+      } finally {
+        active -= 1;
+      }
+    },
+  });
+  const pass = maintainer.checkpointDue({ ...checkpointOptions, concurrency: 2 });
+  while (kinds.podsnapshots!.size < 2) await Bun.sleep(1);
+  release.resolve();
+  await pass;
+  expect(peak).toBe(2);
+  expect(kinds.podsnapshots!.size).toBe(2);
+  await sandboxes.checkpointDue(checkpointOptions);
+  expect(kinds.podsnapshots!.size).toBe(3);
+});
+
+for (const operation of ['checkpoint', 'sleep'] as const) {
+  test(`skips a stale candidate after a concurrent ${operation}`, async () => {
+    const { sandboxes, backend, pod, request, sleep } = cluster({
+      drainStatus: 0,
+      restores: true,
+    });
+    await sandboxes.acquire(ID, signal);
+    pod(ID).metadata.labels['energy-created-ms'] = '1';
+    let raced = false;
+    const maintainer = backend({
+      request: async (method, path, body) => {
+        const result = await request(method, path, body);
+        if (method === 'GET' && path.includes('/podsnapshots?') && !raced) {
+          raced = true;
+          if (operation === 'sleep') await sleep(ID);
+          else await sandboxes.checkpoint(ID);
+        }
+        return result;
+      },
+    });
+    expect(await maintainer.checkpointDue(checkpointOptions)).toEqual({
+      attempted: 1,
+      succeeded: 0,
+      skipped: 1,
+      failed: [],
+    });
+  });
+}

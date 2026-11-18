@@ -24,6 +24,7 @@ if (exitCode !== 0) throw new Error(result);
 await sandboxes.checkpoint(sandbox.id);
 ```
 
+- **Schedule checkpoints.** Call `await sandboxes.checkpointDue({ intervalMs: 600_000, concurrency: 4 })` from your backend scheduler. This checkpoints running sandboxes whose latest ready snapshot is at least ten minutes old, using sandbox age for the first checkpoint. Each checkpoint briefly pauses its sandbox. The result gives `attempted`, `succeeded`, and `skipped` counts for due candidates and a `failed` list with sandbox IDs and errors.
 - **Keep active work running.** Call the returned `touch()` periodically while an agent is busy. A sandbox nothing has used for five minutes is put to sleep by the sweeper the quickstart deploys, which calls `sleepUnused()` once a minute. If jobs run in the background, supply `drain(sandbox)` to check for work before sleep. Returning `false` keeps it awake. `drain` is code in your backend, so call `sleepUnused()` there on a schedule and deploy with `TF_VAR_sweeper_enabled=false`. Explicit `sleep(id)` checks the same conditions.
 - **Manage saved files.** Use `find(id)` to inspect a sandbox without waking it. Call `delete(id)` when its files can be discarded and other callers have finished with the ID.
 - **Bring your tools.** Use a stable image with POSIX shell utilities and writable `/var/tmp`. Pin the image digest in production. To share a read-only set of tools across sandboxes, pass `runtime: { image, mountPath }`. Use `boot(labels)` to start a service once the filesystem is ready.

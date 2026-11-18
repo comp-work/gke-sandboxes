@@ -35,6 +35,27 @@ export type SandboxEvent = {
   durationMs: number;
   error: unknown;
 };
+
+export type CheckpointDueResult = {
+  /** Candidates that appeared due in the initial listing. */
+  attempted: number;
+  succeeded: number;
+  skipped: number;
+  failed: { sandboxId: string; error: unknown }[];
+};
+
+/** A checkpoint could not release its pod claim. A named snapshot is already ready. */
+export class CheckpointReleaseError extends Error {
+  constructor(pod: string, readonly snapshot: string | undefined, cause: unknown) {
+    super(
+      `Could not release the checkpoint claim for pod ${pod}.` +
+        (snapshot ? ` Snapshot ${snapshot} is ready.` : ''),
+      { cause },
+    );
+    this.name = 'CheckpointReleaseError';
+  }
+}
+
 type ResourceList = { cpu: string; memory: string; 'ephemeral-storage': string };
 export type SandboxResources = { requests: ResourceList; limits: ResourceList };
 // Sandboxes are mostly idle, so nodes are packed by the request, not by the limit. The disk limit
@@ -525,25 +546,88 @@ export class GkeSandboxes {
    * written since. The sandbox is paused while the snapshot is taken.
    */
   async checkpoint(sandboxId: string) {
+    await this.checkpointSandbox(sandboxId);
+  }
+
+  private async checkpointSandbox(sandboxId: string, dueBefore?: number) {
     const pod = await this.livePod(sandboxId);
-    if (!pod || pod.status.phase !== 'Running' || sleeping(pod)) return;
+    if (!pod || pod.status.phase !== 'Running' || sleeping(pod)) return false;
     const claimed = await this.claim(pod, [
       { op: 'test', path: SLEEPING_PATH, value: pod.metadata.annotations[SLEEPING_ANNOTATION]! },
       { op: 'replace', path: SLEEPING_PATH, value: String(Date.now()) },
     ]);
-    if (!claimed) return;
+    if (!claimed) return false;
     const startedAt = Date.now();
+    let snapshot: string | undefined;
+    const failures: unknown[] = [];
     try {
-      await this.dropOlderSnapshots(sandboxId, await this.snapshot(pod));
-      this.report('checkpoint', pod.metadata.labels, pod, startedAt, null);
+      // Another backend may have checkpointed since the sweep listed the sandbox.
+      const current = dueBefore === undefined ? null : await this.find(sandboxId);
+      if (
+        dueBefore === undefined ||
+        (current?.pod?.metadata.uid === pod.metadata.uid &&
+          current.pod.status.phase === 'Running' &&
+          !terminating(current.pod) &&
+          (current.sleptMs ?? current.createdMs) <= dueBefore)
+      ) {
+        snapshot = await this.snapshot(pod);
+        await this.dropOlderSnapshots(sandboxId, snapshot);
+      }
     } catch (error) {
-      this.report('checkpoint', pod.metadata.labels, pod, startedAt, error);
-      throw error;
-    } finally {
+      failures.push(error);
+    }
+    try {
       await this.kubernetes.request('PATCH', `${this.pods}/${pod.metadata.name}`, {
         metadata: { annotations: { [SLEEPING_ANNOTATION]: '0' } },
       });
+    } catch (cause) {
+      failures.push(new CheckpointReleaseError(pod.metadata.name, snapshot, cause));
     }
+    if (failures.length) {
+      const error =
+        failures.length === 1
+          ? failures[0]
+          : new AggregateError(failures, `Checkpoint and claim release failed for ${sandboxId}.`);
+      this.report('checkpoint', pod.metadata.labels, pod, startedAt, error);
+      throw error;
+    }
+    if (!snapshot) return false;
+    this.report('checkpoint', pod.metadata.labels, pod, startedAt, null);
+    return true;
+  }
+
+  /** Checkpoints running sandboxes whose latest snapshot or creation time is old enough. */
+  async checkpointDue({
+    intervalMs,
+    concurrency = 4,
+  }: { intervalMs: number; concurrency?: number }): Promise<CheckpointDueResult> {
+    if (!Number.isFinite(intervalMs) || intervalMs <= 0)
+      throw new Error('intervalMs must be a positive finite number.');
+    if (!Number.isSafeInteger(concurrency) || concurrency < 1)
+      throw new Error('concurrency must be a positive safe integer.');
+    const dueBefore = Date.now() - intervalMs;
+    const due = (await this.list({})).filter(
+      ({ pod, sleptMs, createdMs }) =>
+        pod &&
+        pod.status.phase === 'Running' &&
+        !sleeping(pod) &&
+        (sleptMs ?? createdMs) <= dueBefore,
+    );
+    const result: CheckpointDueResult = { attempted: due.length, succeeded: 0, skipped: 0, failed: [] };
+    const pending = due.values();
+    await Promise.all(
+      Array.from({ length: Math.min(concurrency, due.length) }, async () => {
+        for (const { name } of pending) {
+          try {
+            if (await this.checkpointSandbox(name, dueBefore)) result.succeeded += 1;
+            else result.skipped += 1;
+          } catch (error) {
+            result.failed.push({ sandboxId: name, error });
+          }
+        }
+      }),
+    );
+    return result;
   }
 
   async sleepUnused() {

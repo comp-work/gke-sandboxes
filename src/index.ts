@@ -62,7 +62,14 @@ export type GkeSandboxOptions = {
   boot?: (labels: Labels) => { shell: string; args: string[] };
   drain?: (sandbox: SandboxEnvironment) => Promise<boolean>;
   onOperation?: (event: SandboxEvent) => void;
-  onPodLost?: (labels: Labels, phase: string, reason: string, hasSnapshot: boolean) => void;
+  /** The recovery point is empty if the selected snapshot has no usable timestamp. */
+  onPodLost?: (
+    labels: Labels,
+    phase: string,
+    reason: string,
+    hasSnapshot: boolean,
+    recoveryPoint: { recoveryPointAt?: string; recoveryPointAgeMs?: number },
+  ) => void;
 };
 const SANDBOX_LABEL = 'energy-sandbox';
 const CREATED_LABEL = 'energy-created-ms';
@@ -703,16 +710,9 @@ export class GkeSandboxes {
     while (true) {
       signal.throwIfAborted();
       if (pod && (terminating(pod) || !['Running', 'Pending'].includes(pod.status.phase))) {
-        if (!terminating(pod)) {
-          // Everything written since the last snapshot is gone with the pod.
-          const reason =
-            pod.status.containerStatuses.find(({ state }) => state?.terminated?.reason)?.state
-              ?.terminated?.reason ??
-            pod.status.reason ??
-            pod.status.phase;
-          this.options.onPodLost?.(sandbox.labels, pod.status.phase, reason, !!snapshot);
-          await this.kubernetes.request('DELETE', `${this.pods}/${pod.metadata.name}`);
-        }
+        const lost = !terminating(pod);
+        const detectedAt = Date.now();
+        if (lost) await this.kubernetes.request('DELETE', `${this.pods}/${pod.metadata.name}`);
         // The pod's last snapshot may be newer than the listing. One of another creation under
         // this id belongs to a sandbox that was replaced, not to this one.
         const [listed] = await this.list({ [SANDBOX_LABEL]: id });
@@ -720,6 +720,22 @@ export class GkeSandboxes {
           listed && listed.labels[CREATED_LABEL] === sandbox.labels[CREATED_LABEL]
             ? listed.snapshots[0]
             : undefined;
+        if (lost && this.options.onPodLost) {
+          const reason =
+            pod.status.containerStatuses.find(({ state }) => state?.terminated?.reason)?.state
+              ?.terminated?.reason ??
+            pod.status.reason ??
+            pod.status.phase;
+          const sleptMs = snapshot ? listed?.sleptMs : null;
+          const recoveryPoint =
+            sleptMs != null && Number.isFinite(sleptMs)
+              ? {
+                  recoveryPointAt: new Date(sleptMs).toISOString(),
+                  recoveryPointAgeMs: Math.max(0, detectedAt - sleptMs),
+                }
+              : {};
+          this.options.onPodLost(sandbox.labels, pod.status.phase, reason, !!snapshot, recoveryPoint);
+        }
         pod = null;
       }
       if (pod) break;

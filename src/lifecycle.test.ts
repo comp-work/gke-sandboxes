@@ -1,5 +1,11 @@
-import { afterAll, expect, test } from 'bun:test';
-import { GkeSandboxes, KubernetesApi, KubernetesApiError, sandboxState } from './index.ts';
+import { afterAll, expect, mock, test } from 'bun:test';
+import {
+  GkeSandboxes,
+  KubernetesApi,
+  KubernetesApiError,
+  sandboxState,
+  type GkeSandboxOptions,
+} from './index.ts';
 
 // The sleep, wake and recovery rules, against a stand-in for the Kubernetes API. Ported from the
 // tests of Energy's dispatcher, which this library was extracted from.
@@ -42,7 +48,9 @@ afterAll(() => Promise.all(servers.map((server) => server.stop(true))));
 // exec; a snapshot copies them and a pod created with the restore annotation gets them back.
 // Requests are answered directly. A watch is the client's own, served over HTTP, and is sent each
 // change made through a request or `change`.
-const cluster = (options: { drainStatus: 0 | 3; restores: boolean }) => {
+const cluster = (
+  options: { drainStatus: 0 | 3; restores: boolean } & Pick<GkeSandboxOptions, 'onPodLost'>,
+) => {
   // Deleted pods stay listed as shutting down until a test lets them go.
   let lingering = false;
   // A pod stays pending and a snapshot unfinished until a test moves them on.
@@ -267,6 +275,7 @@ const cluster = (options: { drainStatus: 0 | 3; restores: boolean }) => {
       image: 'registry/sandbox:1',
       serviceAccount: 'sandbox',
       drain: async (sandbox) => (await sandbox.process.executeCommand('drain-idle')).exitCode !== 3,
+      onPodLost: options.onPodLost,
     });
   const sandboxes = backend();
   // A sandbox's pod has its own name, which changes with every wake.
@@ -462,6 +471,107 @@ test('a pod that dies comes back with everything up to its last checkpoint', asy
     '/home/user/before=checkpoint',
     '/var/tmp/.energy-sandbox-id=' + ID,
   ]);
+});
+
+test('reports the newest completed checkpoint when a pod is evicted', async () => {
+  const onPodLost = mock<NonNullable<GkeSandboxOptions['onPodLost']>>();
+  const { sandboxes, kinds, pod, filesOf, change } = cluster({ drainStatus: 0, restores: true, onPodLost });
+  await sandboxes.acquire(ID, signal);
+  await sandboxes.checkpoint(ID);
+  const [older] = kinds.podsnapshots!.values();
+  filesOf(ID).add('/home/user/saved=yes');
+  await sandboxes.checkpoint(ID);
+  const [latest] = kinds.podsnapshots!.values();
+  kinds.podsnapshots!.set(older!.metadata.name, older!);
+  kinds.podsnapshots!.set('unfinished', {
+    metadata: { ...latest!.metadata, name: 'unfinished', creationTimestamp: new Date().toISOString() },
+    status: { conditions: [{ type: 'Ready', status: 'False' }] },
+  });
+  pod(ID).metadata.annotations['getenergy.com/sleeping-ms'] = String(Date.now() - 400_000);
+  const { labels } = pod(ID).metadata;
+  change(pod(ID), { phase: 'Failed', reason: 'Evicted' });
+
+  const before = Date.now();
+  await sandboxes.acquire(ID, signal);
+  const at = latest!.metadata.creationTimestamp;
+  expect(onPodLost).toHaveBeenCalledTimes(1);
+  expect(onPodLost).toHaveBeenCalledWith(labels, 'Failed', 'Evicted', true, {
+    recoveryPointAt: at,
+    recoveryPointAgeMs: expect.any(Number),
+  });
+  const age = onPodLost.mock.calls[0]![4].recoveryPointAgeMs!;
+  expect(age).toBeGreaterThanOrEqual(before - Date.parse(at));
+  expect(age).toBeLessThanOrEqual(Date.now() - Date.parse(at));
+  expect(filesOf(ID).has('/home/user/saved=yes')).toBe(true);
+});
+
+test('reports a lost pod without a recovery point when there is no snapshot', async () => {
+  const onPodLost = mock<NonNullable<GkeSandboxOptions['onPodLost']>>();
+  const { sandboxes, pod, change } = cluster({ drainStatus: 0, restores: true, onPodLost });
+  await sandboxes.acquire(ID, signal);
+  const { labels } = pod(ID).metadata;
+  change(pod(ID), { phase: 'Failed', reason: 'Evicted' });
+
+  await sandboxes.acquire(ID, signal);
+  expect(onPodLost).toHaveBeenCalledWith(labels, 'Failed', 'Evicted', false, {});
+});
+
+test('restores a snapshot with an invalid timestamp without reporting its age', async () => {
+  const onPodLost = mock<NonNullable<GkeSandboxOptions['onPodLost']>>();
+  const { sandboxes, kinds, pod, change } = cluster({ drainStatus: 0, restores: true, onPodLost });
+  await sandboxes.acquire(ID, signal);
+  await sandboxes.checkpoint(ID);
+  const [snapshot] = kinds.podsnapshots!.values();
+  snapshot!.metadata.creationTimestamp = 'invalid';
+  const { labels } = pod(ID).metadata;
+  change(pod(ID), { phase: 'Failed', reason: 'Evicted' });
+
+  await sandboxes.acquire(ID, signal);
+  expect(onPodLost).toHaveBeenCalledWith(labels, 'Failed', 'Evicted', true, {});
+  expect(pod(ID).metadata.annotations['podsnapshot.gke.io/ps-name']).toBe(snapshot!.metadata.name);
+});
+
+test('a four-argument callback reports no snapshot from an older sandbox with the same ID', async () => {
+  const lost = mock();
+  const { sandboxes, kinds, pod, filesOf, change } = cluster({
+    drainStatus: 0,
+    restores: true,
+    onPodLost: (labels, phase, reason, hasSnapshot) => lost(labels, phase, reason, hasSnapshot),
+  });
+  await sandboxes.acquire(ID, signal);
+  filesOf(ID).add('/home/user/old=yes');
+  await sandboxes.checkpoint(ID);
+  const [snapshot] = kinds.podsnapshots!.values();
+  snapshot!.metadata.labels['energy-created-ms'] = '0';
+  const { labels } = pod(ID).metadata;
+  change(pod(ID), { phase: 'Failed', reason: 'Evicted' });
+
+  await sandboxes.acquire(ID, signal);
+  expect(lost).toHaveBeenCalledWith(labels, 'Failed', 'Evicted', false);
+  expect(filesOf(ID).has('/home/user/old=yes')).toBe(false);
+});
+
+test('reports a checkpoint that appears when the snapshot listing is refreshed', async () => {
+  const onPodLost = mock<NonNullable<GkeSandboxOptions['onPodLost']>>();
+  const { backend, request, kinds, pod, change } = cluster({ drainStatus: 0, restores: true, onPodLost });
+  let stale = false;
+  const sandboxes = backend({
+    request: async (method, path, body) => {
+      if (stale && method === 'GET' && path.includes('/podsnapshots?')) {
+        stale = false;
+        return { items: [] };
+      }
+      return request(method, path, body);
+    },
+  });
+  await sandboxes.acquire(ID, signal);
+  await sandboxes.checkpoint(ID);
+  const [snapshot] = kinds.podsnapshots!.values();
+  stale = true;
+  change(pod(ID), { phase: 'Failed', reason: 'Evicted' });
+
+  await sandboxes.acquire(ID, signal);
+  expect(onPodLost.mock.calls[0]?.[4].recoveryPointAt).toBe(snapshot!.metadata.creationTimestamp);
 });
 
 test('a caller outlasts a sleep that was abandoned', async () => {

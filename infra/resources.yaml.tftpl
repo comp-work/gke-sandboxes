@@ -1,0 +1,289 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sandboxes
+  labels:
+    pod-security.kubernetes.io/enforce: baseline
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  namespace: sandboxes
+  name: sandboxes
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/managed-by: gke-sandboxes
+  policyTypes: [Ingress, Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchExpressions:
+              - key: k8s-app
+                operator: In
+                values: [node-local-dns, kube-dns]
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  namespace: sandboxes
+  name: default-deny
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  namespace: sandboxes
+  name: sandbox
+---
+apiVersion: podsnapshot.gke.io/v1
+kind: PodSnapshotStorageConfig
+metadata:
+  namespace: sandboxes
+  name: sandboxes
+spec:
+  snapshotStorageConfig:
+    gcs:
+      bucket: ${bucket}
+      path: snapshots
+      # GKE's service agent mints a token limited to one snapshot's path. With the default, the
+      # sandbox's own identity could read every snapshot in the bucket.
+      tokenSource: federatedP4SA
+---
+apiVersion: podsnapshot.gke.io/v1
+kind: PodSnapshotPolicy
+metadata:
+  namespace: sandboxes
+  name: sandboxes
+spec:
+  storageConfigName: sandboxes
+  selector:
+    matchLabels:
+      app.kubernetes.io/managed-by: gke-sandboxes
+  snapshotScope: rootfs-only
+  triggerConfig:
+    type: manual
+    postCheckpoint: resume
+  snapshotGroupingRules:
+    groupByLabelValue:
+      labels:
+        - energy-sandbox
+        - energy-created-ms
+        - app.kubernetes.io/managed-by
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: sandboxes
+  name: sandbox-controller
+rules:
+  - apiGroups: ['']
+    resources: [pods]
+    verbs: [get, list, watch, create, patch, delete, deletecollection]
+  - apiGroups: ['']
+    resources: [pods/exec]
+    verbs: [get, create]
+  - apiGroups: [podsnapshot.gke.io]
+    resources: [podsnapshots]
+    verbs: [get, list, watch, delete, deletecollection]
+  - apiGroups: [podsnapshot.gke.io]
+    resources: [podsnapshotmanualtriggers]
+    verbs: [get, watch, create, delete, deletecollection]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  namespace: sandboxes
+  name: sandbox-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sandbox-controller
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: User
+    name: ${controller}
+  - kind: ServiceAccount
+    namespace: sandbox-system
+    name: sandbox-sweeper
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: sandbox-headroom
+value: -10
+preemptionPolicy: Never
+globalDefault: false
+description: Placeholder pods that any sandbox may evict.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: sandboxes
+  name: sandbox-headroom
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sandbox-headroom
+  template:
+    metadata:
+      labels:
+        app: sandbox-headroom
+    spec:
+      runtimeClassName: gvisor
+      priorityClassName: sandbox-headroom
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: placeholder
+          image: docker.io/library/debian:bookworm-slim
+          command: [sleep, infinity]
+          resources:
+            requests:
+              cpu: '4'
+              memory: 16Gi
+              ephemeral-storage: 64Gi
+            limits:
+              cpu: '4'
+              memory: 16Gi
+              ephemeral-storage: 64Gi
+---
+# What runs beside the sandboxes. The sandboxes namespace denies its pods all traffic by default,
+# so the cluster's own helpers live here.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sandbox-system
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  namespace: sandbox-system
+  name: sandbox-sweeper
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  namespace: sandbox-system
+  name: sandbox-sweeper
+data:
+  sweeper.mjs: |
+    // Puts sandboxes to sleep once nothing has used them for the idle time. A sandbox only sleeps
+    // when something asks, and this asks once a minute.
+    import { readFile } from 'node:fs/promises';
+    import { GkeSandboxes, KubernetesApi } from '@getenergy/gke-sandboxes';
+
+    const token = async () =>
+      (await readFile('/var/run/secrets/kubernetes.io/serviceaccount/token', 'utf8')).trim();
+    const sandboxes = new GkeSandboxes(new KubernetesApi('https://kubernetes.default.svc', token), {
+      namespace: 'sandboxes',
+      // Only used to create sandboxes, which the sweeper never does.
+      serviceAccount: 'sandbox',
+      image: 'unused',
+      idleTimeoutMs: Number(process.env.IDLE_TIMEOUT_MS),
+      onOperation: ({ operation, outcome, labels, pod, durationMs, error }) =>
+        console.log(
+          JSON.stringify({
+            event: 'sandbox_sweep',
+            operation,
+            outcome,
+            sandbox: labels['energy-sandbox'],
+            pod,
+            duration_ms: durationMs,
+            error: error ? String(error) : undefined,
+          }),
+        ),
+    });
+    for (;;) {
+      const started = Date.now();
+      await sandboxes
+        .sleepUnused()
+        .catch((error) => console.error(JSON.stringify({ event: 'sandbox_sweep_failed', error: String(error) })));
+      await new Promise((resolve) => setTimeout(resolve, Math.max(0, 60000 - (Date.now() - started))));
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: sandbox-system
+  name: sandbox-sweeper
+spec:
+  replicas: ${sweeper_replicas}
+  # Two sweepers would only race for the same sandboxes.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: sandbox-sweeper
+  template:
+    metadata:
+      labels:
+        app: sandbox-sweeper
+    spec:
+      serviceAccountName: sandbox-sweeper
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: sweeper
+          configMap:
+            name: sandbox-sweeper
+        - name: work
+          emptyDir: {}
+      containers:
+        - name: sweeper
+          image: docker.io/library/node:22-slim
+          command:
+            - sh
+            - -c
+            - cd /work && cp /sweeper/sweeper.mjs . && npm install --no-audit --no-fund --silent "$PACKAGE" && exec node sweeper.mjs
+          env:
+            - name: PACKAGE
+              value: '${sweeper_package}'
+            - name: IDLE_TIMEOUT_MS
+              value: '${sweeper_idle_ms}'
+            - name: HOME
+              value: /work
+            # Node does not trust the cluster's own certificate authority by default.
+            - name: NODE_EXTRA_CA_CERTS
+              value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          volumeMounts:
+            - name: sweeper
+              mountPath: /sweeper
+            - name: work
+              mountPath: /work
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 20m
+              memory: 128Mi
+            limits:
+              memory: 256Mi

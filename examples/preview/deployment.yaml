@@ -1,0 +1,120 @@
+# Runs the preview proxy beside the sandboxes. Before applying, create its script and secret:
+#
+#   kubectl create configmap sandbox-preview -n sandbox-system --from-file=proxy.mjs=examples/preview/proxy.mjs
+#   kubectl create secret generic sandbox-preview -n sandbox-system --from-literal=secret="$(openssl rand -hex 32)"
+#
+# The Service is reachable inside the cluster only. Put your own ingress and TLS in front of it.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  namespace: sandbox-system
+  name: sandbox-preview
+---
+# The proxy finds a sandbox's pod and marks it as in use, which the controller's role allows.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  namespace: sandboxes
+  name: sandbox-preview
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sandbox-controller
+subjects:
+  - kind: ServiceAccount
+    namespace: sandbox-system
+    name: sandbox-preview
+---
+# Sandboxes accept no incoming traffic by default. This lets the proxy, and only the proxy, in.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  namespace: sandboxes
+  name: sandbox-preview
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/managed-by: gke-sandboxes
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: sandbox-system
+          podSelector:
+            matchLabels:
+              app: sandbox-preview
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: sandbox-system
+  name: sandbox-preview
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sandbox-preview
+  template:
+    metadata:
+      labels:
+        app: sandbox-preview
+    spec:
+      serviceAccountName: sandbox-preview
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: script
+          configMap:
+            name: sandbox-preview
+        - name: work
+          emptyDir: {}
+      containers:
+        - name: proxy
+          image: docker.io/library/node:22-slim
+          command:
+            - sh
+            - -c
+            - cd /work && cp /script/proxy.mjs . && npm install --no-audit --no-fund --silent @getenergy/gke-sandboxes@0.3.0 && exec node proxy.mjs
+          env:
+            - name: PREVIEW_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: sandbox-preview
+                  key: secret
+            - name: HOME
+              value: /work
+            - name: NODE_EXTRA_CA_CERTS
+              value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: script
+              mountPath: /script
+            - name: work
+              mountPath: /work
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 20m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: sandbox-system
+  name: sandbox-preview
+spec:
+  selector:
+    app: sandbox-preview
+  ports:
+    - port: 80
+      targetPort: 8080

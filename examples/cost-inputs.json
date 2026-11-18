@@ -1,0 +1,13 @@
+{
+  "hours": 730,
+  "averageAwake": 520,
+  "sandboxesPerNode": 56,
+  "minimumNodes": 3,
+  "spareNodes": 2,
+  "nodeAndDiskPerHour": 0.79,
+  "clusterAndSystemPerMonth": 373,
+  "snapshotStoragePerMonth": 100,
+  "networkAndLoggingPerMonth": 0,
+  "managedPerSandboxHour": 0.1656,
+  "managedExtrasPerMonth": 0
+}

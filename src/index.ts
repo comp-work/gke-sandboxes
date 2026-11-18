@@ -333,7 +333,7 @@ export class GkeSandboxes {
       });
       if (!fresh && !(await this.markAcquired(pod))) continue;
       return {
-        sandbox: this.environment(id, 'started'),
+        sandbox: this.makeEnvironment(id, 'started', pod.metadata.name),
         startState,
         labels: pod.metadata.labels,
         podName: pod.metadata.name,

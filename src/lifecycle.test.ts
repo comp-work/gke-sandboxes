@@ -185,6 +185,7 @@ const cluster = (options: { drainStatus: 0 | 3; restores: boolean }) => {
       announce(kind, 'MODIFIED', resource);
       return resource;
     }
+    if (resources.has(input.metadata.name)) throw new KubernetesApiError(409, 'Already exists');
     const resource: Resource = {
       metadata: {
         ...input.metadata,
@@ -289,6 +290,11 @@ const cluster = (options: { drainStatus: 0 | 3; restores: boolean }) => {
     lingering = true;
   };
   const specOf = (sandboxId: string) => specs.get(pod(sandboxId).metadata.name);
+  // What the kubelet does once a deleted pod has shut down.
+  const remove = (resource: Resource) => {
+    kinds.pods!.delete(resource.metadata.name);
+    announce('pods', 'DELETED', resource);
+  };
   // What the kubelet or GKE's snapshot controller does to a resource.
   const change = (resource: Resource, status: Resource['status']) => {
     resource.status = status;
@@ -311,6 +317,7 @@ const cluster = (options: { drainStatus: 0 | 3; restores: boolean }) => {
     sandboxes,
     backend,
     change,
+    remove,
     counts,
     watching,
     endWatches,
@@ -532,23 +539,51 @@ test('the first command after an acquire runs in its pod without looking it up',
   }
 });
 
-test('a new pod is kept when the listing does not have it yet', async () => {
-  const { backend, request, pod } = cluster({ drainStatus: 0, restores: true });
-  // A listing read just after a pod was created can be older than the pod.
-  let created = false;
+test('callers that start a sandbox at the same moment share one pod', async () => {
+  const { backend, request, exec, kinds, sleep } = cluster({ drainStatus: 0, restores: true });
+  let created = 0;
+  const ran: string[] = [];
   const sandboxes = backend({
     request: async (method, path, body) => {
-      if (method === 'GET' && created && path.includes('energy-sandbox%3D')) {
-        created = false;
-        return { items: [] };
-      }
-      if (method === 'POST' && path.endsWith('/pods')) created = true;
-      return request(method, path, body);
+      const result = await request(method, path, body);
+      if (method === 'POST' && path.endsWith('/pods')) created += 1;
+      return result;
+    },
+    exec: async (...call) => {
+      ran.push(call[0].split('/').at(-1)!);
+      return exec(...call);
     },
   });
-  await sandboxes.acquire(ID, signal);
-  expect(pod(ID).metadata.name).toStartWith(`${ID}-`);
-  expect(await stateOf(sandboxes)).toBe('started');
+  const first = async () => {
+    const { sandbox } = await sandboxes.acquire(ID, signal);
+    await sandbox.process.executeCommand('true');
+  };
+  for (const start of ['create', 'wake']) {
+    created = 0;
+    ran.length = 0;
+    await Promise.all([first(), first()]);
+    // Kubernetes refused the second pod, so both callers ran their first command in the first.
+    expect([start, created, new Set(ran).size, kinds.pods!.size]).toEqual([start, 1, 1, 1]);
+    await sleep(ID);
+  }
+});
+
+test('a pod waits for one of the same name that is still shutting down', async () => {
+  const { sandboxes, kinds, pod, linger, remove, watching } = cluster({
+    drainStatus: 0,
+    restores: true,
+  });
+  const { podName } = await sandboxes.acquire(ID, signal);
+  const deleted = pod(ID);
+  linger();
+  // Nothing was snapshotted, so the sandbox starts over from nothing, as its first pod did.
+  await sandboxes.delete(ID);
+  const acquiring = sandboxes.acquire(ID, signal);
+  await watching(1);
+  expect([...kinds.pods!.values()]).toEqual([deleted]);
+  remove(deleted);
+  expect((await acquiring).podName).toBe(podName);
+  expect(pod(ID)).not.toBe(deleted);
 });
 
 test('a caller is told that its pod has started, and does not keep asking', async () => {

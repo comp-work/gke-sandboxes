@@ -510,6 +510,35 @@ test('the sweep puts idle sandboxes to sleep together, not one after another', a
   expect(together).toBe(4);
 });
 
+test('the first command after an acquire runs in its pod without looking it up', async () => {
+  const { backend, request, exec, sleep } = cluster({ drainStatus: 0, restores: true });
+  let lookups = 0;
+  const ran: string[] = [];
+  const sandboxes = backend({
+    request: async (method, path, body) => {
+      if (method === 'GET' && path.includes('/pods?')) lookups += 1;
+      return request(method, path, body);
+    },
+    exec: async (...call) => {
+      ran.push(call[0].split('/').at(-1)!);
+      return exec(...call);
+    },
+  });
+  for (const startState of ['missing', 'started', 'stopped']) {
+    const acquired = await sandboxes.acquire(ID, signal);
+    expect(acquired.startState).toBe(startState);
+    lookups = 0;
+    ran.length = 0;
+    await acquired.sandbox.process.executeCommand('true');
+    expect([lookups, ran]).toEqual([0, [acquired.podName]]);
+    // A handle kept past the handoff finds the sandbox's pod again, which may have changed.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await acquired.sandbox.process.executeCommand('true');
+    expect([lookups, ran]).toEqual([1, [acquired.podName, acquired.podName]]);
+    if (startState === 'started') await sleep(ID);
+  }
+});
+
 test('callers that start a sandbox at the same moment share one pod', async () => {
   const { backend, request, exec, kinds, sleep } = cluster({ drainStatus: 0, restores: true });
   let created = 0;

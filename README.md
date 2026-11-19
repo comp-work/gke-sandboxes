@@ -63,7 +63,9 @@ Costs are for one sandbox at 2 vCPU and 4 GB. Managed providers are at list pric
 
 #### Cost while awake
 
-Every bar in the chart above prices the same mostly idle sandbox, at the 0.076 vCPU that Energy’s running sandboxes averaged, about 4% of 2 vCPU. Daytona, E2B and Fly.io charge for the full size while it runs. Vercel charges for the CPU in use and all of the memory. Modal charges for what is used. The GKE figure is a whole cluster bill divided by its sandboxes: 520 awake at 56 to a machine, with two spare machines, node disks, system nodes, the cluster fee and snapshot storage. It needs that scale. A small cluster still pays for its minimum machines. Over a 730-hour month awake, 1.9¢ an hour is $14.22. Packed tighter on C4D machines, the GKE compute estimate falls to about $7.80 a month, or 1.1¢ an hour.
+Every bar in the chart above prices the same mostly idle sandbox, at the 0.076 vCPU that Energy’s running sandboxes averaged, about 4% of 2 vCPU. Daytona, E2B and Fly.io charge for the full size while it runs. Vercel charges for the CPU in use and all of the memory. Modal charges for what is used above a default reservation of 0.25 vCPU and 128 MiB. The GKE figure is a whole cluster bill divided by its sandboxes: 520 awake at 56 to a machine, with two spare machines, node disks, system nodes, the cluster fee and snapshot storage. It needs that scale. A small cluster still pays for its minimum machines. Over a 730-hour month awake, 1.9¢ an hour is $14.22. Packed tighter on C4D machines, the GKE compute estimate falls to about $7.80 a month, or 1.1¢ an hour.
+
+The 2 vCPU and 4 GB is a size on some bars and a ceiling on others. For Daytona, E2B, Fly.io and Vercel it is the size the sandbox is created with. For Modal and GKE it is the most a sandbox may use: Modal reserves 0.25 vCPU and 128 MiB by default, and gke-sandboxes reserves 0.25 vCPU and 1 GiB. A Modal sandbox that reserves the full size costs 23.8¢ an hour.
 
 #### Cost while asleep
 

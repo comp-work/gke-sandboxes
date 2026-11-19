@@ -1,4 +1,4 @@
-import { createHash, randomBytes, randomInt, randomUUID } from 'node:crypto';
+import { createHash, randomInt, randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createWriteStream } from 'node:fs';
 import { readFile, rm } from 'node:fs/promises';
@@ -699,43 +699,63 @@ export class GkeSandboxes {
       if (current) sandbox.labels = current.labels;
     }
     const startedAt = Date.now();
-    if (pod && (terminating(pod) || !['Running', 'Pending'].includes(pod.status.phase))) {
-      if (!terminating(pod)) {
-        // Everything written since the last snapshot is gone with the pod.
-        const reason =
-          pod.status.containerStatuses.find(({ state }) => state?.terminated?.reason)?.state
-            ?.terminated?.reason ??
-          pod.status.reason ??
-          pod.status.phase;
-        this.options.onPodLost?.(sandbox.labels, pod.status.phase, reason, !!snapshot);
-        await this.kubernetes.request('DELETE', `${this.pods}/${pod.metadata.name}`);
-      }
-      // The pod's last snapshot may be newer than the listing. One of another creation under
-      // this id belongs to a sandbox that was replaced, not to this one.
-      const [listed] = await this.list({ [SANDBOX_LABEL]: id });
-      snapshot =
-        listed && listed.labels[CREATED_LABEL] === sandbox.labels[CREATED_LABEL]
-          ? listed.snapshots[0]
-          : undefined;
-      pod = null;
-    }
     let created = false;
-    if (!pod) {
+    while (true) {
+      signal.throwIfAborted();
+      if (pod && (terminating(pod) || !['Running', 'Pending'].includes(pod.status.phase))) {
+        if (!terminating(pod)) {
+          // Everything written since the last snapshot is gone with the pod.
+          const reason =
+            pod.status.containerStatuses.find(({ state }) => state?.terminated?.reason)?.state
+              ?.terminated?.reason ??
+            pod.status.reason ??
+            pod.status.phase;
+          this.options.onPodLost?.(sandbox.labels, pod.status.phase, reason, !!snapshot);
+          await this.kubernetes.request('DELETE', `${this.pods}/${pod.metadata.name}`);
+        }
+        // The pod's last snapshot may be newer than the listing. One of another creation under
+        // this id belongs to a sandbox that was replaced, not to this one.
+        const [listed] = await this.list({ [SANDBOX_LABEL]: id });
+        snapshot =
+          listed && listed.labels[CREATED_LABEL] === sandbox.labels[CREATED_LABEL]
+            ? listed.snapshots[0]
+            : undefined;
+        pod = null;
+      }
+      if (pod) break;
       // A fresh filesystem must also get the caller's initial labels.
       if (!snapshot) sandbox.labels = initialLabels;
-      // A new name every time, so a wake never waits for the previous pod to finish shutting down.
-      const name = `${id}-${randomBytes(3).toString('hex')}`;
-      const own = PodSchema.parse(
-        await this.kubernetes.request('POST', this.pods, this.manifest(sandbox, name, snapshot)),
+      // Named after the snapshot it starts from. Kubernetes creates a name once, so callers that
+      // start the sandbox at the same moment get one pod between them. And a wake never waits
+      // for the pod it replaces to finish shutting down, which started from an earlier snapshot.
+      const name = `${id}-${createHash('sha256')
+        .update(snapshot ?? '')
+        .digest('hex')
+        .slice(0, 6)}`;
+      try {
+        pod = PodSchema.parse(
+          await this.kubernetes.request('POST', this.pods, this.manifest(sandbox, name, snapshot)),
+        );
+        created = true;
+        break;
+      } catch (error) {
+        if (!(error instanceof KubernetesApiError && error.status === 409)) throw error;
+      }
+      // The name is taken. By a pod another caller just created, which is this caller's too. Or by
+      // one that started from the same snapshot and died or was deleted: Kubernetes removes a
+      // dead pod at once, and one still shutting down has to go before its name is free.
+      const taken = await this.kubernetes.watch(
+        this.pods,
+        name,
+        (found) => {
+          const current = found ? PodSchema.parse(found) : null;
+          return current && terminating(current) ? undefined : current;
+        },
+        startedAt + START_SECONDS * 1000,
+        signal,
       );
-      // Another dispatch or file request may have created one at the same moment. Both keep the
-      // older one. This pod counts whether or not the listing has it yet.
-      pod = [
-        own,
-        ...(await this.livePods(id)).filter(({ metadata }) => metadata.name !== name),
-      ].sort(oldestLiveFirst)[0]!;
-      created = pod === own;
-      if (!created) await this.kubernetes.request('DELETE', `${this.pods}/${name}`);
+      if (taken === undefined) throw new Error(`Sandbox ${id} did not finish starting.`);
+      pod = taken;
     }
     // Only the caller whose pod it is reports the start; one that waits for another's does not.
     const operation = created ? (snapshot ? 'wake' : 'create') : null;

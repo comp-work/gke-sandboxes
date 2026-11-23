@@ -37,12 +37,14 @@ export type SandboxEvent = {
 };
 type ResourceList = { cpu: string; memory: string; 'ephemeral-storage': string };
 export type SandboxResources = { requests: ResourceList; limits: ResourceList };
-// Sandboxes are mostly idle, so nodes are packed by the request, not by the limit. The disk limit
-// is the size of the sandbox's root filesystem: `df` reports it and a write past it fails.
+// Sandboxes are mostly idle, so nodes are packed by the request, not by the limit. The kubelet
+// counts a sandbox's root filesystem, scratch /tmp and logs against the disk limit and evicts a
+// pod that exceeds it, so the limit is what one sandbox may take of its node's disk.
 export const DEFAULT_RESOURCES: SandboxResources = {
   requests: { cpu: '250m', memory: '1Gi', 'ephemeral-storage': '4Gi' },
-  limits: { cpu: '2', memory: '4Gi', 'ephemeral-storage': '20Gi' },
+  limits: { cpu: '2', memory: '4Gi', 'ephemeral-storage': '40Gi' },
 };
+export const DEFAULT_DISK = '20Gi';
 export type GkeSandboxOptions = {
   namespace: string;
   image: string;
@@ -52,6 +54,13 @@ export type GkeSandboxOptions = {
   runtime?: { image: string; mountPath: string };
   /** What a sandbox reserves on its node and may use at most. Defaults to `DEFAULT_RESOURCES`. */
   resources?: SandboxResources;
+  /**
+   * The size of a sandbox's root filesystem, `DEFAULT_DISK` unless given. `df` reports it and a
+   * write past it fails. It must be below the `ephemeral-storage` limit: the difference is what a
+   * full sandbox may still hold in /tmp before it is evicted. A sleeping sandbox holding more than
+   * this does not wake.
+   */
+  disk?: string;
   /**
    * A sandbox that reaches its memory limit is killed whole. By default each sandbox watches its
    * own memory and ends its largest processes first. `protect` lists command-line fragments of
@@ -90,9 +99,9 @@ const QUANTITY_UNITS: Record<string, number> = {
 };
 // gVisor takes a size in bytes, not a Kubernetes quantity.
 const quantityBytes = (quantity: string) => {
-  const [, digits, unit] = /^(\d+)(Ki|Mi|Gi|Ti|k|M|G|T)?$/.exec(quantity) ?? [];
-  if (!digits) throw new Error(`Unsupported ephemeral-storage limit: ${quantity}`);
-  return Number(digits) * (unit ? QUANTITY_UNITS[unit]! : 1);
+  const [, amount, unit] = /^(\d+(?:\.\d+)?)(Ki|Mi|Gi|Ti|k|M|G|T)?$/.exec(quantity) ?? [];
+  if (!amount) throw new Error(`Unsupported disk size: ${quantity}`);
+  return Math.floor(Number(amount) * (unit ? QUANTITY_UNITS[unit]! : 1));
 };
 // Written by a sandbox's first pod as it starts. A woken pod without it was not restored from its
 // snapshot.
@@ -308,8 +317,13 @@ export class GkeSandboxes {
     )
       throw new Error('A manager selector cannot use reserved workspace labels.');
     this.idleTimeoutMs = options.idleTimeoutMs ?? 300_000;
-    const { limits } = options.resources ?? DEFAULT_RESOURCES;
-    this.diskBytes = quantityBytes(limits['ephemeral-storage']);
+    const disk = options.disk ?? DEFAULT_DISK;
+    const limit = (options.resources ?? DEFAULT_RESOURCES).limits['ephemeral-storage'];
+    this.diskBytes = quantityBytes(disk);
+    if (this.diskBytes >= quantityBytes(limit))
+      throw new Error(
+        `The disk (${disk}) must be below the ephemeral-storage limit (${limit}), which also covers /tmp and logs.`,
+      );
     if (
       !Object.keys(this.manager).length ||
       !Number.isFinite(this.idleTimeoutMs) ||
@@ -858,7 +872,6 @@ export class GkeSandboxes {
     name: string,
     snapshot: string | undefined,
   ) {
-    const { requests, limits } = this.options.resources ?? DEFAULT_RESOURCES;
     return {
       apiVersion: 'v1',
       kind: 'Pod',
@@ -870,7 +883,8 @@ export class GkeSandboxes {
           [SLEEPING_ANNOTATION]: '0',
           'kubernetes.io/egress-bandwidth': EGRESS_BANDWIDTH,
           // gVisor gives the root filesystem this size. Without it the filesystem has none: `df`
-          // reports 8 EiB free, and the only limit is the kubelet's, which evicts the pod.
+          // reports 8 EiB free, and the only limit is the kubelet's, which evicts the pod. gVisor
+          // cannot size the scratch volume at /tmp, so the kubelet's limit still bounds that.
           'dev.gvisor.flag.overlay2': `root:self,size=${this.diskBytes}`,
           ...(snapshot ? { [RESTORE_ANNOTATION]: snapshot } : {}),
         },
@@ -923,13 +937,7 @@ export class GkeSandboxes {
                   ]
                 : []),
             ],
-            // The kubelet counts the root filesystem, scratch /tmp and logs together and evicts
-            // a pod over the limit. Twice the root filesystem leaves a full sandbox as much again
-            // for /tmp, which gVisor cannot size.
-            resources: {
-              requests,
-              limits: { ...limits, 'ephemeral-storage': String(2 * this.diskBytes) },
-            },
+            resources: this.options.resources ?? DEFAULT_RESOURCES,
           },
         ],
       },

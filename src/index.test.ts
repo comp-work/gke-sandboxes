@@ -5,7 +5,7 @@ import { GkeSandboxes, KubernetesApi, KubernetesApiError } from './index.ts';
 const image = 'example.test/workload@sha256:' + '1'.repeat(64);
 const resources = {
   requests: { cpu: '100m', memory: '850Mi', 'ephemeral-storage': '4Gi' },
-  limits: { cpu: '4', memory: '8Gi', 'ephemeral-storage': '20Gi' },
+  limits: { cpu: '4', memory: '8Gi', 'ephemeral-storage': '40Gi' },
 };
 
 // Serve the pod creation response at the same HTTP boundary the public client uses.
@@ -90,13 +90,11 @@ test('a caller-supplied image and ID work with the standalone snapshot and netwo
     expect(script).toContain('gke-sandboxes-memory-watchdog');
     expect(script).toContain('[ "$pid" -ne $$$$ ]');
     expect(script).not.toMatch(/-ne \$\$ \]/);
-    const podLimits = { ...resources.limits, 'ephemeral-storage': String(40 * 2 ** 30) };
     expect(podSpec).toMatchObject({
       runtimeClassName: 'gvisor',
       automountServiceAccountToken: false,
       serviceAccountName: 'sandbox',
-      // The kubelet's limit is twice the 20 GiB root filesystem, so a full sandbox keeps /tmp.
-      containers: [{ image, resources: { requests: resources.requests, limits: podLimits } }],
+      containers: [{ image, resources }],
       volumes: [{ name: 'scratch', emptyDir: {} }],
     });
     expect(podAnnotations).toMatchObject({
@@ -122,17 +120,21 @@ test('invalid workspace IDs cannot expand a delete selector', async () => {
   await expect(engine.deleteMatching({})).rejects.toThrow('selector is required');
 });
 
-test('a disk limit that cannot be given to gVisor in bytes is refused', () => {
-  const limits = { ...resources.limits, 'ephemeral-storage': '1.5Gi' };
-  expect(
-    () =>
-      new GkeSandboxes(new KubernetesApi('https://example.invalid', async () => 'test'), {
-        namespace: 'sandboxes',
-        serviceAccount: 'sandbox',
-        image,
-        resources: { requests: resources.requests, limits },
-      }),
-  ).toThrow('Unsupported ephemeral-storage limit: 1.5Gi');
+test('the disk must be a size in bytes below the ephemeral-storage limit', () => {
+  const build = (disk: string, limit: string) => () =>
+    new GkeSandboxes(new KubernetesApi('https://example.invalid', async () => 'test'), {
+      namespace: 'sandboxes',
+      serviceAccount: 'sandbox',
+      image,
+      disk,
+      resources: {
+        requests: resources.requests,
+        limits: { ...resources.limits, 'ephemeral-storage': limit },
+      },
+    });
+  expect(build('1.5Gi', '2G')).not.toThrow();
+  expect(build('20Gi', '20Gi')).toThrow('must be below the ephemeral-storage limit (20Gi)');
+  expect(build('20GB', '40Gi')).toThrow('Unsupported disk size: 20GB');
 });
 
 test('warm claims avoid local races and keep retained handles valid across pod replacements', async () => {

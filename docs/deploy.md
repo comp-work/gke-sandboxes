@@ -53,7 +53,7 @@ Then give the client the matching sandbox size:
 ```ts
 resources: {
   requests: { cpu: '100m', memory: '850Mi', 'ephemeral-storage': '4Gi' },
-  limits: { cpu: '4', memory: '8Gi', 'ephemeral-storage': '20Gi' },
+  limits: { cpu: '4', memory: '8Gi', 'ephemeral-storage': '40Gi' },
 },
 ```
 

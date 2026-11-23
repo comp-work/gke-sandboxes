@@ -5,7 +5,7 @@ import { GkeSandboxes, KubernetesApi, KubernetesApiError } from './index.ts';
 const image = 'example.test/workload@sha256:' + '1'.repeat(64);
 const resources = {
   requests: { cpu: '100m', memory: '850Mi', 'ephemeral-storage': '4Gi' },
-  limits: { cpu: '4', memory: '8Gi', 'ephemeral-storage': '20Gi' },
+  limits: { cpu: '4', memory: '8Gi', 'ephemeral-storage': '40Gi' },
 };
 
 // Serve the pod creation response at the same HTTP boundary the public client uses.
@@ -38,6 +38,7 @@ test('a caller-supplied image and ID work with the standalone snapshot and netwo
       )?.spec,
     );
   let podSpec: unknown;
+  let podAnnotations: unknown;
   const server = Bun.serve({
     port: 0,
     async fetch(request) {
@@ -49,6 +50,7 @@ test('a caller-supplied image and ID work with the standalone snapshot and netwo
           spec: unknown;
         };
         podSpec = manifest.spec;
+        podAnnotations = manifest.metadata.annotations;
         return Response.json({
           metadata: {
             ...manifest.metadata,
@@ -95,6 +97,9 @@ test('a caller-supplied image and ID work with the standalone snapshot and netwo
       containers: [{ image, resources }],
       volumes: [{ name: 'scratch', emptyDir: {} }],
     });
+    expect(podAnnotations).toMatchObject({
+      'dev.gvisor.flag.overlay2': `root:self,size=${20 * 2 ** 30}`,
+    });
   } finally {
     await server.stop(true);
   }
@@ -113,6 +118,23 @@ test('invalid workspace IDs cannot expand a delete selector', async () => {
   );
   await expect(engine.delete('x,y')).rejects.toThrow(/pattern/);
   await expect(engine.deleteMatching({})).rejects.toThrow('selector is required');
+});
+
+test('the disk must be a size in bytes below the ephemeral-storage limit', () => {
+  const build = (disk: string, limit: string) => () =>
+    new GkeSandboxes(new KubernetesApi('https://example.invalid', async () => 'test'), {
+      namespace: 'sandboxes',
+      serviceAccount: 'sandbox',
+      image,
+      disk,
+      resources: {
+        requests: resources.requests,
+        limits: { ...resources.limits, 'ephemeral-storage': limit },
+      },
+    });
+  expect(build('1.5Gi', '2G')).not.toThrow();
+  expect(build('20Gi', '20Gi')).toThrow('must be below the ephemeral-storage limit (20Gi)');
+  expect(build('20GB', '40Gi')).toThrow('Unsupported disk size: 20GB');
 });
 
 test('warm claims avoid local races and keep retained handles valid across pod replacements', async () => {

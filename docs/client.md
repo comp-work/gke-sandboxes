@@ -32,7 +32,7 @@ await sandboxes.checkpoint(sandbox.id);
 - **Survive a runaway program.** A sandbox that reaches its memory limit is killed whole, and loses what it wrote since its last snapshot. Each sandbox therefore watches its own memory and ends its largest processes first. The ended command sees the reason on its error output. Pass `memoryWatchdog: { protect: ['my-service'] }` to name processes it must never end, or `memoryWatchdog: false` to turn it off. Each time it acts it prints a JSON line with `"event":"sandbox_memory_pressure"` to the container’s log, which GKE sends to Cloud Logging with the pod’s name and labels.
 - **Look across sandboxes.** `list(labels)` returns every sandbox with those labels, awake or asleep. `inventory()` adds where each one’s snapshots are stored, for metering. `deleteMatching(labels)` deletes every sandbox with those labels. Labels you pass to `acquire` as a third argument are set when a sandbox is created.
 - **Reach a port.** `endpoint(sandbox, port)` returns the sandbox’s private address. The quickstart blocks incoming traffic to sandboxes, so allow your caller in a network policy first, as the preview example does.
-- **Size the sandbox.** Pass `resources: { requests, limits }` to set what a sandbox reserves on its node and the most it may use. The requests decide how many sandboxes fit on a machine.
+- **Size the sandbox.** Pass `resources: { requests, limits }` to set what a sandbox reserves on its node and the most it may use. The requests decide how many sandboxes fit on a machine. Pass `disk` to set the size of the sandbox’s root filesystem, which must be below the `ephemeral-storage` limit.
 
 ## Keep sandboxes ready for new sessions
 

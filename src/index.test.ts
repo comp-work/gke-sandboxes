@@ -38,6 +38,7 @@ test('a caller-supplied image and ID work with the standalone snapshot and netwo
       )?.spec,
     );
   let podSpec: unknown;
+  let podAnnotations: unknown;
   const server = Bun.serve({
     port: 0,
     async fetch(request) {
@@ -49,6 +50,7 @@ test('a caller-supplied image and ID work with the standalone snapshot and netwo
           spec: unknown;
         };
         podSpec = manifest.spec;
+        podAnnotations = manifest.metadata.annotations;
         return Response.json({
           metadata: {
             ...manifest.metadata,
@@ -88,12 +90,17 @@ test('a caller-supplied image and ID work with the standalone snapshot and netwo
     expect(script).toContain('gke-sandboxes-memory-watchdog');
     expect(script).toContain('[ "$pid" -ne $$$$ ]');
     expect(script).not.toMatch(/-ne \$\$ \]/);
+    const podLimits = { ...resources.limits, 'ephemeral-storage': String(40 * 2 ** 30) };
     expect(podSpec).toMatchObject({
       runtimeClassName: 'gvisor',
       automountServiceAccountToken: false,
       serviceAccountName: 'sandbox',
-      containers: [{ image, resources }],
+      // The kubelet's limit is twice the 20 GiB root filesystem, so a full sandbox keeps /tmp.
+      containers: [{ image, resources: { requests: resources.requests, limits: podLimits } }],
       volumes: [{ name: 'scratch', emptyDir: {} }],
+    });
+    expect(podAnnotations).toMatchObject({
+      'dev.gvisor.flag.overlay2': `root:self,size=${20 * 2 ** 30}`,
     });
   } finally {
     await server.stop(true);
@@ -113,6 +120,19 @@ test('invalid workspace IDs cannot expand a delete selector', async () => {
   );
   await expect(engine.delete('x,y')).rejects.toThrow(/pattern/);
   await expect(engine.deleteMatching({})).rejects.toThrow('selector is required');
+});
+
+test('a disk limit that cannot be given to gVisor in bytes is refused', () => {
+  const limits = { ...resources.limits, 'ephemeral-storage': '1.5Gi' };
+  expect(
+    () =>
+      new GkeSandboxes(new KubernetesApi('https://example.invalid', async () => 'test'), {
+        namespace: 'sandboxes',
+        serviceAccount: 'sandbox',
+        image,
+        resources: { requests: resources.requests, limits },
+      }),
+  ).toThrow('Unsupported ephemeral-storage limit: 1.5Gi');
 });
 
 test('warm claims avoid local races and keep retained handles valid across pod replacements', async () => {

@@ -38,8 +38,7 @@ export type SandboxEvent = {
 type ResourceList = { cpu: string; memory: string; 'ephemeral-storage': string };
 export type SandboxResources = { requests: ResourceList; limits: ResourceList };
 // Sandboxes are mostly idle, so nodes are packed by the request, not by the limit. The disk limit
-// keeps one sandbox from filling its node. A pod that exceeds it is evicted, not refused the
-// write, and comes back from its last snapshot.
+// is the size of the sandbox's root filesystem: `df` reports it and a write past it fails.
 export const DEFAULT_RESOURCES: SandboxResources = {
   requests: { cpu: '250m', memory: '1Gi', 'ephemeral-storage': '4Gi' },
   limits: { cpu: '2', memory: '4Gi', 'ephemeral-storage': '20Gi' },
@@ -79,6 +78,22 @@ const RESTORE_ANNOTATION = 'podsnapshot.gke.io/ps-name';
 // this rate, about a 16 Gbps node's share for one of 64 sandboxes. No sandbox crowds out its
 // neighbours, and one turned against a host can send it no more than this.
 const EGRESS_BANDWIDTH = '250M';
+const QUANTITY_UNITS: Record<string, number> = {
+  Ki: 2 ** 10,
+  Mi: 2 ** 20,
+  Gi: 2 ** 30,
+  Ti: 2 ** 40,
+  k: 1e3,
+  M: 1e6,
+  G: 1e9,
+  T: 1e12,
+};
+// gVisor takes a size in bytes, not a Kubernetes quantity.
+const quantityBytes = (quantity: string) => {
+  const [, digits, unit] = /^(\d+)(Ki|Mi|Gi|Ti|k|M|G|T)?$/.exec(quantity) ?? [];
+  if (!digits) throw new Error(`Unsupported ephemeral-storage limit: ${quantity}`);
+  return Number(digits) * (unit ? QUANTITY_UNITS[unit]! : 1);
+};
 // Written by a sandbox's first pod as it starts. A woken pod without it was not restored from its
 // snapshot.
 const SANDBOX_ID_FILE = '/var/tmp/.energy-sandbox-id';
@@ -274,6 +289,7 @@ export class GkeSandboxes {
   private readonly snapshotsPath: string;
   private readonly manager: Labels;
   private readonly idleTimeoutMs: number;
+  private readonly diskBytes: number;
 
   constructor(
     private readonly kubernetes: KubernetesApi,
@@ -292,6 +308,8 @@ export class GkeSandboxes {
     )
       throw new Error('A manager selector cannot use reserved workspace labels.');
     this.idleTimeoutMs = options.idleTimeoutMs ?? 300_000;
+    const { limits } = options.resources ?? DEFAULT_RESOURCES;
+    this.diskBytes = quantityBytes(limits['ephemeral-storage']);
     if (
       !Object.keys(this.manager).length ||
       !Number.isFinite(this.idleTimeoutMs) ||
@@ -840,6 +858,7 @@ export class GkeSandboxes {
     name: string,
     snapshot: string | undefined,
   ) {
+    const { requests, limits } = this.options.resources ?? DEFAULT_RESOURCES;
     return {
       apiVersion: 'v1',
       kind: 'Pod',
@@ -850,6 +869,9 @@ export class GkeSandboxes {
           [ACQUIRED_ANNOTATION]: String(Date.now()),
           [SLEEPING_ANNOTATION]: '0',
           'kubernetes.io/egress-bandwidth': EGRESS_BANDWIDTH,
+          // gVisor gives the root filesystem this size. Without it the filesystem has none: `df`
+          // reports 8 EiB free, and the only limit is the kubelet's, which evicts the pod.
+          'dev.gvisor.flag.overlay2': `root:self,size=${this.diskBytes}`,
           ...(snapshot ? { [RESTORE_ANNOTATION]: snapshot } : {}),
         },
       },
@@ -901,7 +923,13 @@ export class GkeSandboxes {
                   ]
                 : []),
             ],
-            resources: this.options.resources ?? DEFAULT_RESOURCES,
+            // The kubelet counts the root filesystem, scratch /tmp and logs together and evicts
+            // a pod over the limit. Twice the root filesystem leaves a full sandbox as much again
+            // for /tmp, which gVisor cannot size.
+            resources: {
+              requests,
+              limits: { ...limits, 'ephemeral-storage': String(2 * this.diskBytes) },
+            },
           },
         ],
       },

@@ -104,7 +104,7 @@ bun examples/benchmark-warm-pool.ts --endpoint "$ENDPOINT" --controller "$CONTRO
 
 ## ComputeSDK benchmark
 
-On the [ComputeSDK sandbox benchmark](https://www.computesdk.com/benchmarks/sandboxes/ratings), gke-sandboxes averaged about 82 over 16 suites on C4D machines and about 74 on E2. On the public table on November 24, 2026, the top provider had 83.8, E2B 73.7 and Daytona 69.1. [Results per suite, method and costs](benchmarks/computesdk-2026-11.md)
+On the [ComputeSDK sandbox benchmark](https://www.computesdk.com/benchmarks/sandboxes/ratings), gke-sandboxes averages about 71 over 16 suites on E2 machines and about 77 on C4D. On the public table on November 24, 2026, the top provider had 83.8, E2B 73.7 and Daytona 69.1. [Results per suite, the settings each needs, and costs](benchmarks/computesdk-2026-11.md)
 
 ## When to choose a managed provider
 

@@ -28,6 +28,7 @@ await sandboxes.checkpoint(sandbox.id);
 - **Manage saved files.** Use `find(id)` to inspect a sandbox without waking it. Call `delete(id)` when its files can be discarded and other callers have finished with the ID.
 - **Bring your tools.** Use a stable image with POSIX shell utilities and writable `/var/tmp`. Pin the image digest in production. To share a read-only set of tools across sandboxes, pass `runtime: { image, mountPath }`. Use `boot(labels)` to start a service once the filesystem is ready.
 - **Run commands.** `executeCommand(command, cwd, env, timeoutSeconds, options)` returns the exit code and the combined output. When the time is up, the command and every process it started are ended in the sandbox. Pass `onOutput(chunk, stream)` to read output as it arrives. The result keeps the first 32 MiB and sets `truncated` beyond that; change it with `maxOutputBytes`.
+- **Skip the cluster for commands.** By default each command and file transfer is an exec call through the Kubernetes API. Pass `directCommands: { port: 7391 }` and every sandbox started from then on runs a small command server on that port, which the client connects to directly. In one cluster a command took 30 ms this way against 220 ms through the API, and a 50 MiB upload 0.7 s against 2.3 s; direct commands also do not queue behind other API calls when many sandboxes are busy. See [what it needs](#run-commands-without-the-kubernetes-api) before turning it on.
 - **Move files.** `sandbox.fs.uploadFile(local, remote)` and `sandbox.fs.downloadFile(remote, local)` copy a file in either direction, binary-safe.
 - **Survive a runaway program.** A sandbox that reaches its memory limit is killed whole, and loses what it wrote since its last snapshot. Each sandbox therefore watches its own memory and ends its largest processes first. The ended command sees the reason on its error output. Pass `memoryWatchdog: { protect: ['my-service'] }` to name processes it must never end, or `memoryWatchdog: false` to turn it off. Each time it acts it prints a JSON line with `"event":"sandbox_memory_pressure"` to the container’s log, which GKE sends to Cloud Logging with the pod’s name and labels.
 - **Look across sandboxes.** `list(labels)` returns every sandbox with those labels, awake or asleep. `inventory()` adds where each one’s snapshots are stored, for metering. `deleteMatching(labels)` deletes every sandbox with those labels. Labels you pass to `acquire` as a third argument are set when a sandbox is created.
@@ -52,3 +53,37 @@ const { sandbox, fromPool, touch } = await pool.create(signal);
 ```
 
 The maintainer checks capacity once a second. It picks up unused pods after a worker restart. To remove spare capacity, stop the maintainer and call `await pool.reconcile(0)`. Assigned sandboxes keep running. Pools support prebuilt images. Use `acquire` directly if your startup command depends on caller labels through `boot(labels)`.
+
+## Run commands without the Kubernetes API
+
+`directCommands: { port }` needs three things that the default does not:
+
+- **A route to the pods.** The backend must be able to open a connection to a pod's address, so it runs in the cluster or on the cluster's VPC. A backend that only has the cluster's API endpoint cannot use this option.
+- **A network rule.** The quickstart blocks incoming traffic to sandboxes. Admit your backend on the port, and nothing else:
+
+  ```yaml
+  apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata:
+    namespace: sandboxes
+    name: sandbox-commands
+  spec:
+    podSelector:
+      matchLabels:
+        app.kubernetes.io/managed-by: gke-sandboxes
+    policyTypes: [Ingress]
+    ingress:
+      - from:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: my-backend
+        ports:
+          - protocol: TCP
+            port: 7391
+  ```
+
+- **Permission to create ConfigMaps** in the sandbox namespace, which the Terraform module grants. The command server is a 30 KB static program inside this package. The client publishes it as a ConfigMap, one per package version, and each sandbox mounts it read-only, so it works with any image.
+
+Each sandbox has its own random token, stored in the pod's annotations, so a caller needs read access to the pod to use it. The client and the server each show the other half of the token before a command is sent. A sandbox therefore cannot run commands in its neighbour, and a pod that takes over a reused address is never told what the previous one was asked to run. The connection itself is not encrypted: it relies on your cluster network being private.
+
+Setting the option changes only sandboxes started afterwards. One that is already running keeps taking commands through the API until it next sleeps and wakes, and a client without the option can still reach every sandbox through the API. A handle remembers the server it last reached, so later commands ask the cluster nothing. If the sandbox has since moved to another pod, the handle finds it again; a `CommandServerUnreachableError` means no command ran.

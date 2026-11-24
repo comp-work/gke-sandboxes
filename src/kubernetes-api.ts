@@ -47,6 +47,30 @@ export type ExecOptions = {
 // A command that prints without end must not exhaust the caller's memory.
 export const DEFAULT_MAX_OUTPUT_BYTES = 32 * 2 ** 20;
 
+/** Gathers a command's output as it arrives, for the result every way of running one returns. */
+export const collectOutput = ({
+  onOutput,
+  maxOutputBytes = DEFAULT_MAX_OUTPUT_BYTES,
+}: ExecOptions) => {
+  const output: Uint8Array[] = [];
+  let kept = 0;
+  let truncated = false;
+  return {
+    add(payload: Uint8Array, stream: 'stdout' | 'stderr') {
+      onOutput?.(payload, stream);
+      const fits = payload.subarray(0, Math.max(0, maxOutputBytes - kept));
+      if (fits.byteLength) output.push(fits);
+      kept += fits.byteLength;
+      truncated ||= fits.byteLength < payload.byteLength;
+    },
+    result: (exitCode: number): KubernetesExecResult => ({
+      exitCode,
+      output: Buffer.concat(output).toString('utf8'),
+      truncated,
+    }),
+  };
+};
+
 /** The few Kubernetes API calls sandboxes need: JSON resources, watches and exec. */
 export class KubernetesApi {
   constructor(
@@ -186,7 +210,7 @@ export class KubernetesApi {
     command: string[],
     stdin: Uint8Array,
     timeoutSeconds: number,
-    { onOutput, maxOutputBytes = DEFAULT_MAX_OUTPUT_BYTES }: ExecOptions = {},
+    options: ExecOptions = {},
   ): Promise<KubernetesExecResult> {
     const url = new URL(`${podPath}/exec`, this.baseUrl);
     url.protocol = 'wss:';
@@ -200,9 +224,7 @@ export class KubernetesApi {
     } as unknown as string[]);
     socket.binaryType = 'arraybuffer';
     const finished = Promise.withResolvers<KubernetesExecResult>();
-    const output: Uint8Array[] = [];
-    let kept = 0;
-    let truncated = false;
+    const collected = collectOutput(options);
     const timer = setTimeout(() => {
       finished.reject(new Error(`Sandbox command timed out after ${timeoutSeconds} seconds.`));
       socket.close();
@@ -220,13 +242,8 @@ export class KubernetesApi {
     socket.onmessage = ({ data }) => {
       const frame = new Uint8Array(data as ArrayBuffer);
       const payload = frame.subarray(1);
-      if (frame[0] === STDOUT || frame[0] === STDERR) {
-        onOutput?.(payload, frame[0] === STDOUT ? 'stdout' : 'stderr');
-        const fits = payload.subarray(0, Math.max(0, maxOutputBytes - kept));
-        if (fits.byteLength) output.push(fits);
-        kept += fits.byteLength;
-        truncated ||= fits.byteLength < payload.byteLength;
-      }
+      if (frame[0] === STDOUT || frame[0] === STDERR)
+        collected.add(payload, frame[0] === STDOUT ? 'stdout' : 'stderr');
       if (frame[0] !== STATUS) return;
       // GKE sends the final status after stdout and stderr. Node can keep the socket
       // open after this frame, so waiting for a close event can time out a finished command.
@@ -236,11 +253,7 @@ export class KubernetesApi {
         if (status.status === 'Failure' && !exitCode) {
           finished.reject(new Error(`Sandbox command failed: ${status.message}`));
         } else {
-          finished.resolve({
-            exitCode: exitCode ? Number(exitCode.message) : 0,
-            output: Buffer.concat(output).toString('utf8'),
-            truncated,
-          });
+          finished.resolve(collected.result(exitCode ? Number(exitCode.message) : 0));
         }
       } catch (error) {
         finished.reject(

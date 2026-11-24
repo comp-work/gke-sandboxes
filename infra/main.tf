@@ -30,7 +30,7 @@ variable "sweeper_idle_seconds" {
 }
 variable "sweeper_package" {
   type        = string
-  default     = "@getenergy/gke-sandboxes@0.5.0"
+  default     = "@getenergy/gke-sandboxes@0.6.0"
   description = "The client package the sweeper installs. Keep it at the version your backend uses."
 }
 variable "snapshot_scope" {

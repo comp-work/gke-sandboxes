@@ -229,6 +229,14 @@ const StoredSnapshotSchema = z.object({
     storageStatus: z.object({ gcs: z.object({ observedGCSPath: z.string().startsWith('gs://') }) }),
   }),
 });
+// A sandbox's keep-alive. Reports of use renew it instead of writing to the pod: GKE checks every
+// pod write with an admission webhook, which is several times slower and queues under load.
+const LeaseSchema = z.object({
+  metadata: z.object({ name: z.string() }),
+  spec: z.object({ renewTime: z.string().optional() }).default({}),
+});
+const renewedMs = (lease: unknown) =>
+  lease ? Date.parse(LeaseSchema.parse(lease).spec.renewTime ?? '') || 0 : 0;
 const TriggerSchema = z.object({
   status: z
     .object({
@@ -294,6 +302,7 @@ const labelSchema = z.record(
 
 export class GkeSandboxes {
   private readonly pods: string;
+  private readonly leases: string;
   private readonly triggers: string;
   private readonly snapshotsPath: string;
   private readonly manager: Labels;
@@ -331,6 +340,7 @@ export class GkeSandboxes {
     )
       throw new Error('A manager label and a positive idle timeout are required.');
     this.pods = `/api/v1/namespaces/${namespace}/pods`;
+    this.leases = `/apis/coordination.k8s.io/v1/namespaces/${namespace}/leases`;
     const api = `/apis/podsnapshot.gke.io/v1/namespaces/${namespace}`;
     this.triggers = `${api}/podsnapshotmanualtriggers`;
     this.snapshotsPath = `${api}/podsnapshots`;
@@ -580,12 +590,22 @@ export class GkeSandboxes {
 
   async sleepUnused() {
     const idleBefore = Date.now() - this.idleTimeoutMs;
+    const [sandboxes, leases] = await Promise.all([
+      this.list({}),
+      this.kubernetes.request('GET', `${this.leases}?labelSelector=${this.selector({})}`),
+    ]);
+    const renewed = new Map(
+      listOf(LeaseSchema)
+        .parse(leases)
+        .items.map((lease) => [lease.metadata.name, renewedMs(lease)]),
+    );
     // All at once: a sleep waits on its snapshot, and one request sweeps the whole cluster, so
     // sleeping in turn reaches only the first few of many idle sandboxes before its deadline.
     await Promise.all(
-      (await this.list({})).map(async ({ pod }) => {
+      sandboxes.map(async ({ pod }) => {
         if (!pod || sleeping(pod) || pod.status.phase !== 'Running') return;
         if (Number(pod.metadata.annotations[ACQUIRED_ANNOTATION]) > idleBefore) return;
+        if ((renewed.get(pod.metadata.name) ?? 0) > idleBefore) return;
         // One sandbox that cannot sleep must not keep the rest awake; the next sweep retries it.
         // A failed sleep has been reported, and one in use is no failure.
         await this.sleepPod(pod).catch(() => undefined);
@@ -970,9 +990,26 @@ export class GkeSandboxes {
   private async touch(sandboxId: string) {
     const pod = await this.livePod(sandboxId);
     if (!pod) return;
-    await this.kubernetes.request('PATCH', `${this.pods}/${pod.metadata.name}`, {
-      metadata: { annotations: { [ACQUIRED_ANNOTATION]: String(Date.now()) } },
-    });
+    const { name, uid } = pod.metadata;
+    // Kubernetes reads this time only with six decimals.
+    const spec = { renewTime: new Date().toISOString().replace('Z', '000Z') };
+    if (await this.kubernetes.request('PATCH', `${this.leases}/${name}`, { spec })) return;
+    // The pod owns its lease, so Kubernetes deletes the lease with the pod.
+    try {
+      await this.kubernetes.request('POST', this.leases, {
+        apiVersion: 'coordination.k8s.io/v1',
+        kind: 'Lease',
+        metadata: {
+          name,
+          labels: this.manager,
+          ownerReferences: [{ apiVersion: 'v1', kind: 'Pod', name, uid }],
+        },
+        spec,
+      });
+    } catch (error) {
+      // Another report created it at the same moment, with the same time.
+      if (!(error instanceof KubernetesApiError && error.status === 409)) throw error;
+    }
   }
 
   async sleep(id: string) {
@@ -995,6 +1032,11 @@ export class GkeSandboxes {
     if (!claimed) throw new SandboxInUseError(name);
     const startedAt = Date.now();
     try {
+      // Read after the claim, so a report of use made while the sweep was deciding still counts.
+      const renewed = renewedMs(
+        await this.kubernetes.request('GET', `${this.leases}/${pod.metadata.name}`),
+      );
+      if (Date.now() - renewed < this.idleTimeoutMs) throw new SandboxInUseError(name);
       if (this.options.drain && !(await this.options.drain(this.environment(name, 'started'))))
         throw new SandboxInUseError(name);
       const snapshot = await this.snapshot(pod);

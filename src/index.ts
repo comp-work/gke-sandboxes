@@ -710,31 +710,35 @@ export class GkeSandboxes {
     while (true) {
       signal.throwIfAborted();
       if (pod && (terminating(pod) || !['Running', 'Pending'].includes(pod.status.phase))) {
-        const lost = !terminating(pod);
-        const detectedAt = Date.now();
-        if (lost) await this.kubernetes.request('DELETE', `${this.pods}/${pod.metadata.name}`);
         // The pod's last snapshot may be newer than the listing. One of another creation under
         // this id belongs to a sandbox that was replaced, not to this one.
         const [listed] = await this.list({ [SANDBOX_LABEL]: id });
-        snapshot =
-          listed && listed.labels[CREATED_LABEL] === sandbox.labels[CREATED_LABEL]
-            ? listed.snapshots[0]
-            : undefined;
-        if (lost && this.options.onPodLost) {
+        const current =
+          listed?.labels[CREATED_LABEL] === sandbox.labels[CREATED_LABEL] ? listed : undefined;
+        snapshot = current?.snapshots[0];
+        if (!terminating(pod)) {
+          // Everything written since that snapshot is gone with the pod. The report comes before
+          // the pod is deleted, so a start that fails here reports the loss when it is retried.
           const reason =
             pod.status.containerStatuses.find(({ state }) => state?.terminated?.reason)?.state
               ?.terminated?.reason ??
             pod.status.reason ??
             pod.status.phase;
-          const sleptMs = snapshot ? listed?.sleptMs : null;
-          const recoveryPoint =
-            sleptMs != null && Number.isFinite(sleptMs)
+          // `sleptMs` is when the newest snapshot, the one this start restores, was taken.
+          const takenMs = snapshot ? current?.sleptMs : null;
+          this.options.onPodLost?.(
+            sandbox.labels,
+            pod.status.phase,
+            reason,
+            !!snapshot,
+            takenMs != null && Number.isFinite(takenMs)
               ? {
-                  recoveryPointAt: new Date(sleptMs).toISOString(),
-                  recoveryPointAgeMs: Math.max(0, detectedAt - sleptMs),
+                  recoveryPointAt: new Date(takenMs).toISOString(),
+                  recoveryPointAgeMs: Math.max(0, Date.now() - takenMs),
                 }
-              : {};
-          this.options.onPodLost(sandbox.labels, pod.status.phase, reason, !!snapshot, recoveryPoint);
+              : {},
+          );
+          await this.kubernetes.request('DELETE', `${this.pods}/${pod.metadata.name}`);
         }
         pod = null;
       }

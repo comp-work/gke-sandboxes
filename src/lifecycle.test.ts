@@ -574,6 +574,29 @@ test('reports a checkpoint that appears when the snapshot listing is refreshed',
   expect(onPodLost.mock.calls[0]?.[4].recoveryPointAt).toBe(snapshot!.metadata.creationTimestamp);
 });
 
+test('reports a lost pod on the next start when the snapshot listing fails', async () => {
+  const onPodLost = mock<NonNullable<GkeSandboxOptions['onPodLost']>>();
+  const { backend, request, pod, change } = cluster({ drainStatus: 0, restores: true, onPodLost });
+  // The start lists snapshots once to find the sandbox and again once it has seen the failed pod.
+  let listings = Infinity;
+  const sandboxes = backend({
+    request: async (method, path, body) => {
+      if (method === 'GET' && path.includes('/podsnapshots?') && --listings === 0)
+        throw new KubernetesApiError(503, 'Snapshot listing unavailable');
+      return request(method, path, body);
+    },
+  });
+  await sandboxes.acquire(ID, signal);
+  const { labels } = pod(ID).metadata;
+  change(pod(ID), { phase: 'Failed', reason: 'Evicted' });
+
+  listings = 2;
+  await expect(sandboxes.acquire(ID, signal)).rejects.toThrow('Snapshot listing unavailable');
+  await sandboxes.acquire(ID, signal);
+  expect(onPodLost).toHaveBeenCalledTimes(1);
+  expect(onPodLost).toHaveBeenCalledWith(labels, 'Failed', 'Evicted', false, {});
+});
+
 test('a caller outlasts a sleep that was abandoned', async () => {
   const { sandboxes, pod, counts } = cluster({
     drainStatus: 0,

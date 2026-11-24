@@ -59,6 +59,11 @@ resources: {
 
 These requests fit 128 sandboxes on a `c4d-highmem-16`, which has about 116 GiB of memory left for pods. Memory is the limit to watch. A node that runs out evicts sandboxes, and they come back from their last snapshot. Measure what your agents use before lowering the memory request. C4D capacity varies by zone. When we tested, one of three Iowa zones had none.
 
+## Optional settings
+
+- `TF_VAR_snapshot_scope=whole-pod` keeps memory and running processes in snapshots, not only files. It needs machines newer than E2, such as C4D.
+- `TF_VAR_pod_security_level=privileged` lets the client add capabilities to sandboxes, for example to [run Docker](client.md#run-docker-in-a-sandbox). The default, `baseline`, refuses them.
+
 ## Clean up
 
 Check for leftover pods and snapshots, then remove the test infrastructure. Keep the local Terraform state until teardown finishes. The example disables bucket soft delete and the bucket must be empty before Terraform can delete it.

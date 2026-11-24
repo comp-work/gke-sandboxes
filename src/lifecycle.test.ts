@@ -20,7 +20,7 @@ type Resource = {
     labels: Record<string, string>;
     annotations: Record<string, string>;
   };
-  spec?: { renewTime?: string };
+  spec?: { renewTime?: string; holderIdentity?: string; acquireTime?: string };
   status: Record<string, unknown>;
 };
 
@@ -119,11 +119,14 @@ const cluster = (
     decodeURIComponent(new URLSearchParams(query).get('labelSelector') ?? '')
       .split(',')
       .filter(Boolean)
-      // `key=value` selects by value, and a bare `key` selects every resource that has the label.
+      // `key=value` selects by value, a bare `key` every resource that has the label, and `!key`
+      // every resource that lacks it.
       .every((pair) =>
         pair.includes('=')
           ? resource.metadata.labels[pair.split('=')[0]!] === pair.split('=')[1]
-          : pair in resource.metadata.labels,
+          : pair.startsWith('!')
+            ? !(pair.slice(1) in resource.metadata.labels)
+            : pair in resource.metadata.labels,
       );
   const request: KubernetesApi['request'] = async (method, path, body) => {
     const [location, query = ''] = path.split('?');
@@ -149,38 +152,72 @@ const cluster = (
           } else {
             resources.delete(resource.metadata.name);
             announce(kind, 'DELETED', resource);
+            // Kubernetes deletes what the pod owns.
+            if (kind === 'pods')
+              for (const lease of [...kinds.leases!.values()])
+                if (
+                  (lease.metadata as { ownerReferences?: { uid: string }[] }).ownerReferences?.some(
+                    ({ uid }) => uid === resource.metadata.uid,
+                  )
+                )
+                  kinds.leases!.delete(lease.metadata.name);
           }
         }
       return {};
     }
-    const input = body as {
+    // What a client sends arrives as a copy, as it does over HTTP.
+    const input = structuredClone(body) as {
       metadata: Partial<Resource['metadata']> & { name: string };
-      spec?: { targetPod: string; containers?: { command: string[] }[]; renewTime?: string };
+      spec?: {
+        targetPod: string;
+        containers?: { command: string[] }[];
+        renewTime?: string;
+        holderIdentity?: string;
+        acquireTime?: string;
+      };
     };
     if (method === 'PATCH') {
       const resource = resources.get(name!);
       if (!resource) return null;
       if (Array.isArray(body)) {
         const operations = body as {
-          op: 'test' | 'replace';
+          op: 'test' | 'replace' | 'add' | 'remove';
           path: string;
           value: string;
         }[];
+        // A test of all of the labels compares them as a whole.
+        const whole = operations.find(({ path }) => path === '/metadata/labels');
+        if (
+          whole &&
+          JSON.stringify(Object.entries(whole.value).sort()) !==
+            JSON.stringify(Object.entries(resource.metadata.labels).sort())
+        )
+          throw new KubernetesApiError(422, 'Test failed');
         const target = ({ path }: { path: string }) => {
+          if (path === '/metadata/resourceVersion')
+            return {
+              values: resource.metadata as unknown as Record<string, string>,
+              field: 'resourceVersion',
+            };
           const [, , group, field] = path.split('/');
           const values = resource.metadata[group as 'labels' | 'annotations'];
-          return { values, field: field!.replaceAll('~1', '/') };
+          return { values, field: field!.replaceAll('~1', '/').replaceAll('~0', '~') };
         };
+        const fields = operations.filter(({ path }) => path !== '/metadata/labels');
         if (
-          operations.some((operation) => {
+          fields.some((operation) => {
             const { values, field } = target(operation);
-            return operation.op === 'test' && values[field] !== operation.value;
+            return (
+              (operation.op === 'test' && values[field] !== operation.value) ||
+              ((operation.op === 'remove' || operation.op === 'replace') && !(field in values))
+            );
           })
         )
           throw new KubernetesApiError(422, 'Test failed');
-        for (const operation of operations) {
+        for (const operation of fields) {
           const { values, field } = target(operation);
-          values[field] = operation.value;
+          if (operation.op === 'remove') delete values[field];
+          else if (operation.op !== 'test') values[field] = operation.value;
         }
         resource.metadata.resourceVersion = String(++version);
         announce(kind, 'MODIFIED', resource);
@@ -188,6 +225,8 @@ const cluster = (
       }
       if (kind === 'leases') {
         resource.spec = { ...resource.spec, ...input.spec };
+        const { ownerReferences } = (input.metadata ?? {}) as { ownerReferences?: unknown };
+        if (ownerReferences) Object.assign(resource.metadata, { ownerReferences });
         return resource;
       }
       Object.assign(resource.metadata.labels, input.metadata.labels);
@@ -210,7 +249,10 @@ const cluster = (
       },
       status: {},
     };
-    if (kind === 'leases') resource.spec = { renewTime: input.spec!.renewTime };
+    if (kind === 'leases') {
+      const { renewTime, holderIdentity, acquireTime } = input.spec!;
+      resource.spec = { renewTime, holderIdentity, acquireTime };
+    }
     resources.set(resource.metadata.name, resource);
     if (kind === 'pods') {
       specs.set(resource.metadata.name, input.spec);
@@ -249,23 +291,46 @@ const cluster = (
     announce(kind, 'ADDED', resource);
     return resource;
   };
-  const exec: KubernetesApi['exec'] = async (podPath, _command, stdin) => {
-    const pod = files.get(podPath.split('/').at(-1)!);
+  // Each file holds one value.
+  const write = (pod: Set<string>, file: string, value: string) => {
+    for (const entry of pod) if (entry.startsWith(`${file}=`)) pod.delete(entry);
+    pod.add(`${file}=${value}`);
+  };
+  const ok = { exitCode: 0, output: '', truncated: false };
+  // The commands each pod was handed out with by a warm pool.
+  const handouts = new Map<string, string[]>();
+  const exec: KubernetesApi['exec'] = async (podPath, command, stdin) => {
+    const podName = podPath.split('/').at(-1)!;
+    const pod = files.get(podName);
     if (!pod) throw new Error('Sandbox command connection failed.');
+    // A pool hands out a pod by giving it its sandbox's id, as `$0`, and starting its service.
+    const handout = /^printf %s "\$0" > (\S+) \|\| exit 1\n/.exec(command[2] ?? '');
+    if (handout) {
+      write(pod, handout[1]!, command[3]!);
+      handouts.set(podName, command);
+      return ok;
+    }
     // A command run for a caller starts by changing directory; the library's own checks do not.
     const script = new TextDecoder().decode(stdin).replace(/^cd .*\n/, '');
     if (script.includes('drain-idle'))
       return { exitCode: options.drainStatus, output: '', truncated: false };
     const written = /^printf %s '(.+)' > '(.+)'$/.exec(script);
-    if (written) pod.add(`${written[2]}=${written[1]}`);
-    const compared = /^test "\$\(cat '(.+)' 2>\/dev\/null\)" = '(.+)'$/.exec(script);
-    if (compared)
-      return {
-        exitCode: pod.has(`${compared[1]}=${compared[2]}`) ? 0 : 1,
-        output: '',
-        truncated: false,
-      };
-    return { exitCode: 0, output: '', truncated: false };
+    if (written) write(pod, written[2]!, written[1]!);
+    // The check of a woken pod's id file, which renames the id of a sandbox it was started from.
+    const checked =
+      /^found="\$\(cat '(.+)' 2>\/dev\/null\)"\n\[ "\$found" = '(.+?)' \](?: \|\| \{ \[ "\$found" = '(.+)' \] && printf %s '.+' > '.+'; \})?$/.exec(
+        script,
+      );
+    if (checked) {
+      const [, file, id, source] = checked;
+      if (pod.has(`${file}=${id}`)) return ok;
+      if (source && pod.has(`${file}=${source}`)) {
+        write(pod, file!, id!);
+        return ok;
+      }
+      return { ...ok, exitCode: 1 };
+    }
+    return ok;
   };
   // The real client, so that its watches are the ones tested.
   const client = (answers: Partial<Pick<KubernetesApi, 'request' | 'exec'>>) =>
@@ -275,13 +340,17 @@ const cluster = (
       ...answers,
     });
   // A backend's client. Its service is asked whether it still has work before a sandbox sleeps.
-  const backend = (api: Partial<Pick<KubernetesApi, 'request' | 'exec'>> = {}) =>
+  const backend = (
+    api: Partial<Pick<KubernetesApi, 'request' | 'exec'>> = {},
+    extra: Partial<GkeSandboxOptions> = {},
+  ) =>
     new GkeSandboxes(client(api), {
       namespace: 'sandboxes',
       image: 'registry/sandbox:1',
       serviceAccount: 'sandbox',
       drain: async (sandbox) => (await sandbox.process.executeCommand('drain-idle')).exitCode !== 3,
       onPodLost: options.onPodLost,
+      ...extra,
     });
   const sandboxes = backend();
   // A sandbox's pod has its own name, which changes with every wake.
@@ -344,6 +413,7 @@ const cluster = (
     },
     request,
     exec,
+    handouts,
     kinds,
     pod,
     filesOf,
@@ -527,7 +597,11 @@ test('a pod that dies comes back with everything up to its last checkpoint', asy
 
 test('reports the newest completed checkpoint when a pod is evicted', async () => {
   const onPodLost = mock<NonNullable<GkeSandboxOptions['onPodLost']>>();
-  const { sandboxes, kinds, pod, filesOf, change } = cluster({ drainStatus: 0, restores: true, onPodLost });
+  const { sandboxes, kinds, pod, filesOf, change } = cluster({
+    drainStatus: 0,
+    restores: true,
+    onPodLost,
+  });
   await sandboxes.acquire(ID, signal);
   await sandboxes.checkpoint(ID);
   const [older] = kinds.podsnapshots!.values();
@@ -536,7 +610,11 @@ test('reports the newest completed checkpoint when a pod is evicted', async () =
   const [latest] = kinds.podsnapshots!.values();
   kinds.podsnapshots!.set(older!.metadata.name, older!);
   kinds.podsnapshots!.set('unfinished', {
-    metadata: { ...latest!.metadata, name: 'unfinished', creationTimestamp: new Date().toISOString() },
+    metadata: {
+      ...latest!.metadata,
+      name: 'unfinished',
+      creationTimestamp: new Date().toISOString(),
+    },
     status: { conditions: [{ type: 'Ready', status: 'False' }] },
   });
   pod(ID).metadata.annotations['getenergy.com/sleeping-ms'] = String(Date.now() - 400_000);
@@ -605,7 +683,11 @@ test('a four-argument callback reports no snapshot from an older sandbox with th
 
 test('reports a checkpoint that appears when the snapshot listing is refreshed', async () => {
   const onPodLost = mock<NonNullable<GkeSandboxOptions['onPodLost']>>();
-  const { backend, request, kinds, pod, change } = cluster({ drainStatus: 0, restores: true, onPodLost });
+  const { backend, request, kinds, pod, change } = cluster({
+    drainStatus: 0,
+    restores: true,
+    onPodLost,
+  });
   let stale = false;
   const sandboxes = backend({
     request: async (method, path, body) => {
@@ -915,4 +997,257 @@ test('a snapshot that GKE could not take leaves the sandbox running', async () =
   await sleeping;
   expect(kinds.podsnapshotmanualtriggers!.size).toBe(0);
   expect(await stateOf(sandboxes)).toBe('started');
+});
+
+const ID_FILE = '/var/tmp/.energy-sandbox-id';
+const POOL = 'getenergy.com/warm-pool';
+const isPodWrite = (method: string, path: string) =>
+  method === 'PATCH' && /\/pods\/[^/?]+$/.test(path);
+
+test("a warm pool hands out a sandbox under the caller's id, before its pod is labelled", async () => {
+  const { backend, request, kinds, handouts, filesOf } = cluster({
+    drainStatus: 0,
+    restores: true,
+  });
+  // Pod writes wait until the test lets them through, as they wait on GKE's admission webhook.
+  const writes = Promise.withResolvers<void>();
+  const sandboxes = backend(
+    {
+      request: async (method, path, body) => {
+        if (isPodWrite(method, path)) await writes.promise;
+        return request(method, path, body);
+      },
+    },
+    { boot: (labels) => ({ shell: 'start-service "$1"', args: [labels.team!] }) },
+  );
+  const pool = sandboxes.warmPool('agents');
+  await pool.reconcile(2);
+
+  const handedOut = await pool.acquire(ID, signal, { team: 'blue' });
+  expect(handedOut).toMatchObject({ fromPool: true, startState: 'missing' });
+  expect(handedOut.labels).toMatchObject({ team: 'blue', 'energy-sandbox': ID });
+  // The pod became the sandbox and started its service before any pod write went through.
+  expect(POOL in kinds.pods!.get(handedOut.podName)!.metadata.labels).toBe(true);
+  const handout = handouts.get(handedOut.podName)!;
+  expect(handout.slice(3)).toEqual([ID, 'blue']);
+  expect(handout[2]).toContain('start-service');
+  // Every lookup by id finds it, and a report of use keeps it awake.
+  expect((await sandboxes.find(ID))?.pod?.metadata.name).toBe(handedOut.podName);
+  expect((await sandboxes.list({ team: 'blue' })).map(({ name }) => name)).toEqual([ID]);
+  await handedOut.touch();
+  expect((await handedOut.sandbox.process.executeCommand('true')).exitCode).toBe(0);
+
+  writes.resolve();
+  await Bun.sleep(10);
+  const { labels } = kinds.pods!.get(handedOut.podName)!.metadata;
+  expect(labels).toMatchObject({ team: 'blue', 'energy-sandbox': ID });
+  expect(POOL in labels).toBe(false);
+  expect(filesOf(ID).has(`${ID_FILE}=${ID}`)).toBe(true);
+
+  // It sleeps and wakes as the caller's sandbox, with its labels.
+  await sandboxes.sleep(ID, { now: true });
+  const woken = await pool.acquire(ID, signal);
+  expect(woken).toMatchObject({ fromPool: false, startState: 'stopped' });
+  expect(woken.labels).toMatchObject({ team: 'blue', 'energy-sandbox': ID });
+  expect(filesOf(ID).has(`${ID_FILE}=${ID}`)).toBe(true);
+
+  await sandboxes.delete(ID);
+  expect(
+    [...kinds.leases!.values()].filter(({ metadata }) => metadata.labels['energy-sandbox'] === ID),
+  ).toEqual([]);
+});
+
+test('callers that ask for the same new sandbox at the same moment get one pod', async () => {
+  const { backend, kinds } = cluster({ drainStatus: 0, restores: true });
+  const replicas = [backend(), backend()];
+  const pools = replicas.map((sandboxes) => sandboxes.warmPool('agents'));
+  await pools[0]!.reconcile(4);
+  const pods = (id: string) =>
+    [...kinds.pods!.values()].filter(({ metadata }) => metadata.labels['energy-sandbox'] === id);
+
+  // Two pools.
+  const both = await Promise.all(pools.map((pool) => pool.acquire('one', signal)));
+  expect(both[0]!.podName).toBe(both[1]!.podName);
+  expect(both.filter(({ fromPool }) => fromPool)).toHaveLength(1);
+  await Bun.sleep(10);
+  expect(pods('one')).toHaveLength(1);
+
+  // A pool and a caller that starts a new pod.
+  const mixed = await Promise.all([
+    pools[0]!.acquire('two', signal),
+    replicas[1]!.acquire('two', signal),
+  ]);
+  expect(mixed[0]!.podName).toBe(mixed[1]!.podName);
+  await Bun.sleep(10);
+  expect(pods('two')).toHaveLength(1);
+});
+
+test("the pool's maintainer keeps handed-out pods, and removes a spare only once it holds it", async () => {
+  const { backend, kinds } = cluster({ drainStatus: 0, restores: true });
+  const sandboxes = backend();
+  const pool = sandboxes.warmPool('agents');
+  const spares = () =>
+    [...kinds.pods!.values()].filter(
+      ({ metadata }) => POOL in metadata.labels && !kinds.leases!.has(metadata.name),
+    ).length;
+  await pool.reconcile(2);
+  const { podName } = await pool.acquire(ID, signal);
+  await pool.reconcile(2);
+  expect([spares(), kinds.pods!.has(podName)]).toEqual([2, true]);
+  await pool.reconcile(0);
+  expect([spares(), kinds.pods!.size]).toEqual([0, 1]);
+
+  // A sandbox handed out while the maintainer shrinks the pool is never deleted under it.
+  await pool.reconcile(1);
+  const [raced] = await Promise.all([pool.acquire('raced', signal), pool.reconcile(0)]);
+  console.log(
+    'DBG',
+    raced.podName,
+    raced.fromPool,
+    [...kinds.pods!.keys()],
+    [...kinds.leases!.keys()],
+  );
+  expect(kinds.pods!.get(raced.podName)?.status).toMatchObject({ phase: 'Running' });
+});
+
+test('a pod that cannot be handed out is removed and the next spare is used', async () => {
+  const { backend, exec, kinds, handouts } = cluster({ drainStatus: 0, restores: true });
+  let failed = '';
+  const sandboxes = backend({
+    exec: async (path, command, ...rest) => {
+      if (!failed && command[2]?.startsWith('printf %s "$0"')) {
+        failed = path.split('/').at(-1)!;
+        return { exitCode: 1, output: 'no room', truncated: false };
+      }
+      return exec(path, command, ...rest);
+    },
+  });
+  const pool = sandboxes.warmPool('agents');
+  await pool.reconcile(2);
+  const { podName, fromPool } = await pool.acquire(ID, signal);
+  expect([fromPool, podName === failed, kinds.pods!.has(failed)]).toEqual([true, false, false]);
+  expect(handouts.has(podName)).toBe(true);
+});
+
+test('a sandbox with a generated id is named after its pod and needs no hand-out command', async () => {
+  const { backend, handouts } = cluster({ drainStatus: 0, restores: true });
+  const pool = backend().warmPool('agents');
+  await pool.reconcile(1);
+  const created = await pool.create(signal, { team: 'blue' });
+  expect([created.fromPool, created.sandbox.id, handouts.size]).toEqual([true, created.podName, 0]);
+});
+
+test('a kept snapshot outlives later sleeps, and new sandboxes start from it', async () => {
+  const { sandboxes, kinds, filesOf } = cluster({ drainStatus: 0, restores: true });
+  const { sandbox } = await sandboxes.acquire(ID, signal);
+  await sandbox.process.executeCommand("printf %s 'kept' > '/home/notes'");
+  const kept = await sandboxes.snapshot(ID);
+  expect(kinds.leases!.get(`${kept}.kept`)?.metadata.labels).toMatchObject({
+    'getenergy.com/kept-snapshot': 'true',
+    'energy-sandbox': ID,
+  });
+  await sandboxes.sleep(ID, { now: true });
+  expect(kinds.podsnapshots!.has(kept)).toBe(true);
+
+  const forks = ['fork-1', 'fork-2', 'fork-3'];
+  await Promise.all(
+    forks.map((id) => sandboxes.acquire(id, signal, { team: 'blue' }, { from: kept })),
+  );
+  for (const id of forks) {
+    expect(filesOf(id).has('/home/notes=kept')).toBe(true);
+    // A fork is its own sandbox: its id file names it, so it wakes as itself.
+    expect(filesOf(id).has(`${ID_FILE}=${id}`)).toBe(true);
+    expect((await sandboxes.find(id))?.labels).toMatchObject({ team: 'blue' });
+  }
+  expect(sandboxes.acquire('fork-1', signal, {}, { from: kept })).rejects.toThrow('already exists');
+  await sandboxes.sleep('fork-1', { now: true });
+  await sandboxes.acquire('fork-1', signal);
+  expect(filesOf('fork-1').has(`${ID_FILE}=fork-1`)).toBe(true);
+
+  await sandboxes.deleteSnapshot(kept);
+  expect(kinds.podsnapshots!.has(kept)).toBe(false);
+});
+
+test('a sandbox in use sleeps at once only when asked to', async () => {
+  const { sandboxes, awake } = cluster({ drainStatus: 0, restores: true });
+  await sandboxes.acquire(ID, signal);
+  expect(sandboxes.sleep(ID)).rejects.toThrow('in use');
+  await sandboxes.sleep(ID).catch(() => undefined);
+  expect(awake()).toEqual([ID]);
+  await sandboxes.sleep(ID, { now: true });
+  expect(awake()).toEqual([]);
+});
+
+test('capabilities are added to the sandbox container', async () => {
+  const { backend, specOf } = cluster({ drainStatus: 0, restores: true });
+  await backend({}, { capabilities: ['NET_ADMIN', 'SYS_ADMIN'] }).acquire(ID, signal);
+  expect(specOf(ID)).toMatchObject({
+    containers: [{ securityContext: { capabilities: { add: ['NET_ADMIN', 'SYS_ADMIN'] } } }],
+  });
+});
+
+test('deleting a sandbox handed out moments ago removes its pod, which does not return to the pool', async () => {
+  const { backend, request, kinds } = cluster({ drainStatus: 0, restores: true });
+  const writes = Promise.withResolvers<void>();
+  const sandboxes = backend({
+    request: async (method, path, body) => {
+      if (isPodWrite(method, path)) await writes.promise;
+      return request(method, path, body);
+    },
+  });
+  const pool = sandboxes.warmPool('agents');
+  await pool.reconcile(1);
+  const { podName } = await pool.acquire(ID, signal);
+  await sandboxes.delete(ID);
+  writes.resolve();
+  await Bun.sleep(10);
+  expect([kinds.pods!.has(podName), await sandboxes.find(ID)]).toEqual([false, null]);
+});
+
+test('a pool pod taken but never handed out is removed, and nothing finds it meanwhile', async () => {
+  const { backend, kinds } = cluster({ drainStatus: 0, restores: true });
+  const sandboxes = backend();
+  const pool = sandboxes.warmPool('agents');
+  await pool.reconcile(2);
+  const [taken, retired] = [...kinds.pods!.values()];
+  // A caller that stopped after taking a pod, and a maintainer that stopped before deleting one.
+  const lease = (pod: typeof taken, holder: string, acquiredMs: number) =>
+    kinds.leases!.set(pod!.metadata.name, {
+      metadata: {
+        name: pod!.metadata.name,
+        uid: crypto.randomUUID(),
+        resourceVersion: '1',
+        creationTimestamp: '',
+        labels: { 'app.kubernetes.io/managed-by': 'gke-sandboxes' },
+        annotations: {},
+      },
+      spec: { holderIdentity: holder, acquireTime: new Date(acquiredMs).toISOString() },
+      status: {},
+    });
+  lease(taken, ID, Date.now());
+  lease(retired!, '', Date.now() - 10 * 60_000);
+  expect(await sandboxes.find(ID)).toBeNull();
+  await pool.reconcile(0);
+  // The recent one may still be handed out; the old one is removed.
+  expect([kinds.pods!.has(taken!.metadata.name), kinds.pods!.has(retired!.metadata.name)]).toEqual([
+    true,
+    false,
+  ]);
+  kinds.leases!.get(taken!.metadata.name)!.spec!.acquireTime = new Date(
+    Date.now() - 10 * 60_000,
+  ).toISOString();
+  await pool.reconcile(0);
+  expect(kinds.pods!.has(taken!.metadata.name)).toBe(false);
+});
+
+test('a fork whose pod is lost before its first snapshot starts from its source again', async () => {
+  const { sandboxes, filesOf, pod, change } = cluster({ drainStatus: 0, restores: true });
+  const { sandbox } = await sandboxes.acquire(ID, signal);
+  await sandbox.process.executeCommand("printf %s 'kept' > '/home/notes'");
+  const kept = await sandboxes.snapshot(ID);
+  await sandboxes.acquire('fork-1', signal, {}, { from: kept });
+  change(pod('fork-1'), { phase: 'Failed', reason: 'Evicted' });
+  await sandboxes.acquire('fork-1', signal);
+  expect(filesOf('fork-1').has('/home/notes=kept')).toBe(true);
+  expect(filesOf('fork-1').has(`${ID_FILE}=fork-1`)).toBe(true);
 });

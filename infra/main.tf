@@ -33,6 +33,24 @@ variable "sweeper_package" {
   default     = "@getenergy/gke-sandboxes@0.5.0"
   description = "The client package the sweeper installs. Keep it at the version your backend uses."
 }
+variable "snapshot_scope" {
+  type        = string
+  default     = "rootfs-only"
+  description = "What a snapshot keeps. rootfs-only keeps files and restores on any node. whole-pod also keeps memory and running processes, and needs machines newer than E2, such as C4D."
+  validation {
+    condition     = contains(["rootfs-only", "whole-pod"], var.snapshot_scope)
+    error_message = "Use rootfs-only or whole-pod."
+  }
+}
+variable "pod_security_level" {
+  type        = string
+  default     = "baseline"
+  description = "The Pod Security level the sandbox namespace enforces. privileged allows the client's capabilities option, for example to run Docker in a sandbox."
+  validation {
+    condition     = contains(["baseline", "privileged"], var.pod_security_level)
+    error_message = "Use baseline or privileged."
+  }
+}
 variable "sandbox_machine_type" {
   type        = string
   default     = "e2-highmem-16"
@@ -358,10 +376,12 @@ output "endpoint" {
 }
 output "manifests" {
   value = templatefile("${path.module}/resources.yaml.tftpl", {
-    bucket           = google_storage_bucket.sandbox_snapshots.name
-    controller       = google_service_account.controller.email
-    sweeper_replicas = var.sweeper_enabled ? 1 : 0
-    sweeper_idle_ms  = var.sweeper_idle_seconds * 1000
-    sweeper_package  = var.sweeper_package
+    bucket             = google_storage_bucket.sandbox_snapshots.name
+    controller         = google_service_account.controller.email
+    sweeper_replicas   = var.sweeper_enabled ? 1 : 0
+    sweeper_idle_ms    = var.sweeper_idle_seconds * 1000
+    sweeper_package    = var.sweeper_package
+    snapshot_scope     = var.snapshot_scope
+    pod_security_level = var.pod_security_level
   })
 }

@@ -45,13 +45,14 @@ await sandboxes.sleep(sandbox.id);
 
 ## Features
 
+- **Snapshot and fork.** Keep a snapshot and start new sandboxes from it.
 - **Sleep and wake.** A sleeping sandbox is a snapshot in Cloud Storage and uses no CPU or memory. Opening its ID wakes it with its files.
 - **Idle sandboxes sleep on their own.** A sweeper puts a sandbox to sleep after five minutes without use.
 - **Isolated.** Each sandbox is its own gVisor pod, with incoming traffic blocked and no access to your cloud credentials.
 - **Your image.** Use any container image with a POSIX shell.
 - **Commands and files.** Run commands with timeouts and streamed output. Upload and download files. A backend on the cluster's network can send them straight to the sandbox, several times faster than through the Kubernetes API.
 - **Memory guard.** A runaway program is ended before it takes the whole sandbox down.
-- **Warm pool.** Keep a few sandboxes ready so a new session starts in under half a second.
+- **Warm pool.** Keep a few sandboxes ready so a new session starts in under half a second, under your own id, even when many start at once.
 - **Preview links.** An example proxy serves a sandbox’s web server through signed links that expire.
 - **Hooks.** Callbacks report every operation’s timing and failures to your own logging.
 

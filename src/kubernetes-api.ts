@@ -19,6 +19,11 @@ const CLOSE = 255;
 const STDIN_CHUNK_BYTES = 256 * 1024;
 
 const GONE = 410;
+// The API server's answer when its cache did not reach a requested version in time.
+const TIMEOUT = 504;
+const ListVersionSchema = z.object({
+  metadata: z.object({ resourceVersion: z.string().optional() }).default({}),
+});
 const WatchedSchema = z.object({ metadata: z.object({ resourceVersion: z.string() }) });
 const WatchEventSchema = z.object({
   type: z.enum(['ADDED', 'MODIFIED', 'DELETED', 'BOOKMARK', 'ERROR']),
@@ -73,10 +78,42 @@ export const collectOutput = ({
 
 /** The few Kubernetes API calls sandboxes need: JSON resources, watches and exec. */
 export class KubernetesApi {
+  // The read of each collection's current version that callers arriving now share.
+  private readonly versions = new Map<string, Promise<string | undefined>>();
+
   constructor(
     private readonly baseUrl: string,
     private readonly accessToken: () => Promise<string>,
   ) {}
+
+  /**
+   * Lists a collection at least as fresh as a read made during the call, from the API server's
+   * cache. A list read as usual goes to etcd and filters every object there, which costs several
+   * times more and queues when many arrive at once. The current version comes from a one-item
+   * read, which callers arriving while it is under way share: such a list may miss a change made
+   * moments before the call, as one read as usual may miss a change made while it is read. `query`
+   * is the URL's query, with its `?`, or empty.
+   */
+  async list(collection: string, query: string): Promise<unknown> {
+    let version = this.versions.get(collection);
+    if (!version) {
+      version = this.request('GET', `${collection}?limit=1`)
+        .then((list) => ListVersionSchema.parse(list).metadata.resourceVersion)
+        .finally(() => this.versions.delete(collection));
+      this.versions.set(collection, version);
+    }
+    const current = await version;
+    if (!current) return this.request('GET', `${collection}${query}`);
+    const fresh = `resourceVersion=${current}&resourceVersionMatch=NotOlderThan`;
+    try {
+      return await this.request('GET', `${collection}${query ? `${query}&` : '?'}${fresh}`);
+    } catch (error) {
+      // The cache fell behind; etcd has the answer.
+      if (error instanceof KubernetesApiError && [GONE, TIMEOUT].includes(error.status))
+        return this.request('GET', `${collection}${query}`);
+      throw error;
+    }
+  }
 
   /**
    * Returns `null` for a missing resource and throws `KubernetesApiError` for other failures. A

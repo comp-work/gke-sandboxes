@@ -63,6 +63,9 @@ test('a caller-supplied image and ID work with the standalone snapshot and netwo
       }
       if (request.method === 'GET' && searchParams.has('labelSelector'))
         return Response.json({ items: [] });
+      // The read that a list from the API server's cache starts with.
+      if (request.method === 'GET' && searchParams.get('limit') === '1')
+        return Response.json({ metadata: { resourceVersion: '1' }, items: [] });
       // A new sandbox records that its id is taken.
       if (pathname.startsWith('/apis/coordination.k8s.io/v1/namespaces/sandboxes/leases'))
         return Response.json(await request.json());
@@ -187,5 +190,47 @@ test('exec returns output and the exit code when GKE sends status and leaves the
     expect(seen).toEqual(['stdout:one', 'stderr:two']);
   } finally {
     Object.defineProperty(globalThis, 'WebSocket', original);
+  }
+});
+
+test('lists come from the API server cache once it has caught up with a shared read', async () => {
+  const seen: string[] = [];
+  let versionReads = 0;
+  let behind = false;
+  const server = Bun.serve({
+    port: 0,
+    async fetch(request) {
+      const { searchParams } = new URL(request.url);
+      seen.push(searchParams.toString());
+      if (searchParams.get('limit') === '1') {
+        versionReads++;
+        await Bun.sleep(20);
+        return Response.json({ metadata: { resourceVersion: '42' }, items: [] });
+      }
+      // The cache can fall behind the version asked for, and the server then says so.
+      if (behind && searchParams.has('resourceVersion'))
+        return new Response('Too large resource version', { status: 504 });
+      return Response.json({ items: [{ query: searchParams.toString() }] });
+    },
+  });
+  try {
+    const api = new KubernetesApi(server.url.href, async () => 'test');
+    const pods = '/api/v1/namespaces/sandboxes/pods';
+    const lists = await Promise.all(
+      ['a', 'b', 'c'].map((name) => api.list(pods, `?labelSelector=sandbox%3D${name}`)),
+    );
+    // Callers that arrive together share one read of the current version.
+    expect(versionReads).toBe(1);
+    for (const list of lists)
+      expect((list as { items: [{ query: string }] }).items[0].query).toEndWith(
+        'resourceVersion=42&resourceVersionMatch=NotOlderThan',
+      );
+    behind = true;
+    const fallback = (await api.list(pods, '?labelSelector=sandbox%3Dd')) as {
+      items: [{ query: string }];
+    };
+    expect([versionReads, fallback.items[0].query]).toEqual([2, 'labelSelector=sandbox%3Dd']);
+  } finally {
+    await server.stop(true);
   }
 });

@@ -19,24 +19,24 @@ Most of the gain came from four things: keeping running sandboxes ready, keeping
 
 ## Results
 
-| Suite | Before | Improved, E2 | Improved, C4D | Daytona | E2B | Best public |
-|---|---|---|---|---|---|---|
-| Burst TTI | 0 | 96 | 96 | 93 | 88 | 99 |
-| DAX (build) | 0 | 43 | 73 | 60 | 53 | 80 |
-| Burst survival | 96 | not rerun | 97 | 100 | 98 | 100 |
-| OS capabilities | 71 | not rerun | 87 | 67 | 76 | 99 |
-| CI capabilities | 59 | not rerun | 94 | 65 | 94 | 100 |
-| CPU burst | 60 | 67 | 66 | 60 | 69 | 76 |
-| CPU | about 8 | about 45 | about 78 | 31 | 11 | 52 |
-| Rootfs | about 68 | about 68 | about 95 | 63 | 58 | 85 |
-| FS I/O (default mode) | 70 | 72 | 86 | 69 | 67 | 81 |
-| FS API | did not finish | 83 | 93 | 74 | 60 | 87 |
-| Snap & restore | no adapter | 77 | 81 | 61 | 85 | 98 |
-| Snapshot | no adapter | 71 | 75 | 42 | 85 | 98 |
-| Fidelity | 0 | 65 | 70 | 52 | 80 | 97 |
-| Snap fan-out | no adapter | 71 | 74 | 73 | 86 | 98 |
-| Pause / resume | 0 | 75 | 75 | 0 | 91 | 99 |
-| OCI boot | not run | not rerun | 75–78 | 70 | 88 | 98 |
+| Suite                 | Before         | Improved, E2 | Improved, C4D | Daytona | E2B | Best public |
+| --------------------- | -------------- | ------------ | ------------- | ------- | --- | ----------- |
+| Burst TTI             | 0              | 96           | 96            | 93      | 88  | 99          |
+| DAX (build)           | 0              | 43           | 73            | 60      | 53  | 80          |
+| Burst survival        | 96             | not rerun    | 97            | 100     | 98  | 100         |
+| OS capabilities       | 71             | not rerun    | 87            | 67      | 76  | 99          |
+| CI capabilities       | 59             | not rerun    | 94            | 65      | 94  | 100         |
+| CPU burst             | 60             | 67           | 66            | 60      | 69  | 76          |
+| CPU                   | about 8        | about 45     | about 78      | 31      | 11  | 52          |
+| Rootfs                | about 68       | about 68     | about 95      | 63      | 58  | 85          |
+| FS I/O (default mode) | 70             | 72           | 86            | 69      | 67  | 81          |
+| FS API                | did not finish | 83           | 93            | 74      | 60  | 87          |
+| Snap & restore        | no adapter     | 77           | 81            | 61      | 85  | 98          |
+| Snapshot              | no adapter     | 71           | 75            | 42      | 85  | 98          |
+| Fidelity              | 0              | 65           | 70            | 52      | 80  | 97          |
+| Snap fan-out          | no adapter     | 71           | 74            | 73      | 86  | 98          |
+| Pause / resume        | 0              | 75           | 75            | 0       | 91  | 99          |
+| OCI boot              | not run        | not rerun    | 75–78         | 70      | 88  | 98          |
 
 The E2 average borrows the C4D score for the four suites not rerun on E2. A suite that runs and fails counts as 0 in the public average, while one a provider has no score for is left out, so the snapshot suites mattered more than polishing suites already in the 60s.
 
@@ -46,12 +46,12 @@ The E2 average borrows the C4D score for the four suites not rerun on E2. A suit
 
 Burst TTI creates sandboxes, runs `node -v` in each and destroys them, 100 at once.
 
-| 100 at once | Median | p95 | Score |
-|---|---|---|---|
-| Cold start | 17–18 s | 28–31 s | 0 |
-| Warm pool, claimed by updating the pod, commands through exec | about 5.5 s | about 10 s | not scored |
-| Warm pool, claimed with a Lease, commands straight to the pod | 1.14–1.25 s | 1.3–1.4 s | 87–88 |
-| Warm pool, claimed with no cluster call, commands straight to the pod | 0.27–0.31 s | | 96 |
+| 100 at once                                                           | Median      | p95        | Score      |
+| --------------------------------------------------------------------- | ----------- | ---------- | ---------- |
+| Cold start                                                            | 17–18 s     | 28–31 s    | 0          |
+| Warm pool, claimed by updating the pod, commands through exec         | about 5.5 s | about 10 s | not scored |
+| Warm pool, claimed with a Lease, commands straight to the pod         | 1.14–1.25 s | 1.3–1.4 s  | 87–88      |
+| Warm pool, claimed with no cluster call, commands straight to the pod | 0.27–0.31 s |            | 96         |
 
 One at a time, a cold start took 2.07 s (score 77.7) on E2 and about 1.3 s on C4D.
 
@@ -63,12 +63,12 @@ The fastest row keeps the pool's bookkeeping in the caller's own database, so a 
 
 ### Work inside the sandbox
 
-| Same settings | E2 | C4D |
-|---|---|---|
-| DAX build | 110–118 s | 53–55 s |
-| CPU, single core | 580 MB/s | 1,240 MB/s |
+| Same settings                          | E2                   | C4D                  |
+| -------------------------------------- | -------------------- | -------------------- |
+| DAX build                              | 110–118 s            | 53–55 s              |
+| CPU, single core                       | 580 MB/s             | 1,240 MB/s           |
 | Rootfs: small files / sequential write | 162 ops/s / 348 MB/s | 541 ops/s / 963 MB/s |
-| FS I/O (default / fsync / large) | 72 / 87 / 23 | 86 / 95 / 41 |
+| FS I/O (default / fsync / large)       | 72 / 87 / 23         | 86 / 95 / 41         |
 
 C4D roughly doubles build, CPU and disk throughput. Start-up, snapshots and capabilities barely change with the machine.
 
@@ -91,43 +91,43 @@ The CPU suite hashes with `sha256sum`, and Debian 12's does not use the CPU's SH
 
 ## What is in the library now
 
-| Change | Status |
-|---|---|
-| Keep-alive renews a Lease instead of writing to the pod | In 0.4.1 |
-| Commands and files straight to the sandbox (`directCommands`) | In 0.5.0, off by default |
-| Warm pool (`warmPool()`) | Already in the library; its claim still updates the pod |
-| Claim a pooled sandbox without a cluster call | Not in the library: needs the caller's own bookkeeping |
-| Snapshot and pause/resume adapters | Benchmark only |
-| Root, extra capabilities, Docker-ready image | Benchmark only; a security decision |
-| C4D machines | A deployment choice; see [deploy on C4D](../deploy.md#deploy-on-c4d) |
+| Change                                                        | Status                                                               |
+| ------------------------------------------------------------- | -------------------------------------------------------------------- |
+| Keep-alive renews a Lease instead of writing to the pod       | In 0.4.1                                                             |
+| Commands and files straight to the sandbox (`directCommands`) | In 0.5.0, off by default                                             |
+| Warm pool (`warmPool()`)                                      | Already in the library; its claim still updates the pod              |
+| Claim a pooled sandbox without a cluster call                 | Not in the library: needs the caller's own bookkeeping               |
+| Snapshot and pause/resume adapters                            | Benchmark only                                                       |
+| Root, extra capabilities, Docker-ready image                  | Benchmark only; a security decision                                  |
+| C4D machines                                                  | A deployment choice; see [deploy on C4D](../deploy.md#deploy-on-c4d) |
 
 ## Keep-alive: Lease against pod writes
 
 Measured from a laptop through `kubectl proxy`, 40 sandboxes:
 
-| | Pod patch | Lease patch |
-|---|---|---|
-| One at a time, median | 256 ms | 170 ms |
-| 40 at once, median / worst | 0.73 s / 1.4 s | 0.40 s / 0.69 s |
-| 200 at once, median / worst | 4.5 s / 9.3 s | 1.2 s / 2.0 s |
+|                             | Pod patch      | Lease patch     |
+| --------------------------- | -------------- | --------------- |
+| One at a time, median       | 256 ms         | 170 ms          |
+| 40 at once, median / worst  | 0.73 s / 1.4 s | 0.40 s / 0.69 s |
+| 200 at once, median / worst | 4.5 s / 9.3 s  | 1.2 s / 2.0 s   |
 
 ## Direct commands with the released library
 
 Measured on November 24 with the 0.5.0 code, from a pod in the same cluster, on E2:
 
-| One sandbox | Direct | Kubernetes API |
-|---|---|---|
+| One sandbox                     | Direct              | Kubernetes API          |
+| ------------------------------- | ------------------- | ----------------------- |
 | `true`, 30 runs, median / worst | 25–30 ms / 32–45 ms | 169–220 ms / 458–473 ms |
-| 50 MiB upload | 0.4–0.7 s | 2.3–3.1 s |
-| 50 MiB download | 1.8 s | 3.6–3.8 s |
+| 50 MiB upload                   | 0.4–0.7 s           | 2.3–3.1 s               |
+| 50 MiB download                 | 1.8 s               | 3.6–3.8 s               |
 
-| 100 sandboxes at once, three rounds | Median | Worst |
-|---|---|---|
-| Direct, handle already used once | 213–230 ms | 264–291 ms |
-| Direct, new handle (one pod lookup first) | 295–302 ms | 368–1,021 ms |
-| Kubernetes API | 1,245–1,604 ms | 1,572–2,102 ms |
-| 1 MiB upload to each, direct | 280 ms | 501 ms |
-| 1 MiB upload to each, Kubernetes API | 4,207 ms | 5,489 ms |
+| 100 sandboxes at once, three rounds       | Median         | Worst          |
+| ----------------------------------------- | -------------- | -------------- |
+| Direct, handle already used once          | 213–230 ms     | 264–291 ms     |
+| Direct, new handle (one pod lookup first) | 295–302 ms     | 368–1,021 ms   |
+| Kubernetes API                            | 1,245–1,604 ms | 1,572–2,102 ms |
+| 1 MiB upload to each, direct              | 280 ms         | 501 ms         |
+| 1 MiB upload to each, Kubernetes API      | 4,207 ms       | 5,489 ms       |
 
 The direct median rises from about 30 ms alone to about 220 ms with 100 at once. We did not find out whether that is the single client process or the sandboxes starting 100 shells.
 
@@ -135,12 +135,12 @@ The direct median rises from about 30 ms alone to about 220 ms with 100 at once.
 
 Prices for C4D and E2 are from third-party listings, not Google's pricing page.
 
-| Change | Cost |
-|---|---|
-| Warm pool | About $8 a month per idle pooled sandbox on E2, about $11 on C4D. A pool of 100 is about 1.6 machines: roughly $830 a month on E2, $1,100 on C4D |
-| Lease keep-alive, direct commands | None |
-| Snapshot adapter, files-only | None beyond the snapshot storage already paid for |
-| Memory-preserving snapshots | Need non-E2 machines; snapshots also store memory, size not measured |
-| Higher limits (8 vCPU / 16 GiB, twice the sized CPU) | Nothing reserved; noisier neighbours under load |
-| C4D instead of E2 | About 33% more per machine: about $0.96 against $0.72 an hour for the 16-vCPU high-memory types |
-| The benchmark runs | A few machine-hours, about $5–10 |
+| Change                                               | Cost                                                                                                                                             |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Warm pool                                            | About $8 a month per idle pooled sandbox on E2, about $11 on C4D. A pool of 100 is about 1.6 machines: roughly $830 a month on E2, $1,100 on C4D |
+| Lease keep-alive, direct commands                    | None                                                                                                                                             |
+| Snapshot adapter, files-only                         | None beyond the snapshot storage already paid for                                                                                                |
+| Memory-preserving snapshots                          | Need non-E2 machines; snapshots also store memory, size not measured                                                                             |
+| Higher limits (8 vCPU / 16 GiB, twice the sized CPU) | Nothing reserved; noisier neighbours under load                                                                                                  |
+| C4D instead of E2                                    | About 33% more per machine: about $0.96 against $0.72 an hour for the 16-vCPU high-memory types                                                  |
+| The benchmark runs                                   | A few machine-hours, about $5–10                                                                                                                 |

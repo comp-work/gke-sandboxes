@@ -105,6 +105,10 @@ rules:
   - apiGroups: [coordination.k8s.io]
     resources: [leases]
     verbs: [get, list, create, patch]
+  # With `directCommands`, the client publishes the sandboxes' command server as a ConfigMap.
+  - apiGroups: ['']
+    resources: [configmaps]
+    verbs: [create]
   - apiGroups: [podsnapshot.gke.io]
     resources: [podsnapshots]
     verbs: [get, list, watch, delete, deletecollection]

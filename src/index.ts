@@ -1,11 +1,18 @@
-import { createHash, randomInt, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomInt, randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createWriteStream } from 'node:fs';
 import { readFile, rm } from 'node:fs/promises';
 import { finished } from 'node:stream/promises';
 import { z } from 'zod';
+import {
+  CommandServerUnreachableError,
+  directExec,
+  type CommandServerAddress,
+} from './command-channel.js';
+import { COMMAND_SERVER } from './command-server-binary.js';
 import { KubernetesApiError, type ExecOptions, type KubernetesApi } from './kubernetes-api.js';
 import { MEMORY_WATCHDOG } from './memory-watchdog.js';
+export { CommandServerUnreachableError } from './command-channel.js';
 export { KubernetesApi, KubernetesApiError, type ExecOptions } from './kubernetes-api.js';
 
 export type SandboxEnvironment = {
@@ -68,6 +75,15 @@ export type GkeSandboxOptions = {
    */
   memoryWatchdog?: false | { protect?: string[] };
   boot?: (labels: Labels) => { shell: string; args: string[] };
+  /**
+   * Runs commands and moves files over a connection straight to the sandbox, on this port,
+   * instead of through the Kubernetes API. A command starts several times sooner and does not
+   * queue behind other API calls on a busy cluster. The caller must be able to reach pod
+   * addresses: on the cluster's network, and allowed in on this port by the sandboxes' network
+   * policy. Each sandbox started with this set runs a small command server that only accepts
+   * its own random token. Sandboxes started without it are still reached through the API.
+   */
+  directCommands?: { port: number };
   drain?: (sandbox: SandboxEnvironment) => Promise<boolean>;
   onOperation?: (event: SandboxEvent) => void;
   onPodLost?: (labels: Labels, phase: string, reason: string, hasSnapshot: boolean) => void;
@@ -83,6 +99,13 @@ const ACQUIRED_PATH = '/metadata/annotations/getenergy.com~1acquired-ms';
 const SLEEPING_PATH = '/metadata/annotations/getenergy.com~1sleeping-ms';
 const RESTORED_ANNOTATION = 'getenergy.com/restore-verified';
 const RESTORE_ANNOTATION = 'podsnapshot.gke.io/ps-name';
+// What a pod's command server listens on and accepts. Only the pod's own record holds the token,
+// so a caller that reads the pod can reach it and a neighbouring pod cannot.
+const COMMAND_PORT_ANNOTATION = 'getenergy.com/command-port';
+const COMMAND_TOKEN_ANNOTATION = 'getenergy.com/command-token';
+const COMMAND_SERVER_MOUNT = '/opt/gke-sandboxes';
+// One ConfigMap per build of the server, so pods of an earlier release keep theirs.
+const COMMAND_SERVER_CONFIG = `gke-sandboxes-command-server-${COMMAND_SERVER.sha256.slice(0, 12)}`;
 // GKE Dataplane V2 runs Cilium's bandwidth manager, which paces a pod's traffic out of its node to
 // this rate, about a 16 Gbps node's share for one of 64 sandboxes. No sandbox crowds out its
 // neighbours, and one turned against a host can send it no more than this.
@@ -133,10 +156,17 @@ const podCommand = (
   first: boolean,
   boot: { shell: string; args: string[] } | null,
   watchdog: { protect: string[] } | null,
+  commandServer: boolean,
 ) => [
   'sh',
   '-c',
   `${first ? `printf %s "$0" > ${SANDBOX_ID_FILE} || exit 1\n` : ''}${
+    // Restarted if it ever ends: without it the sandbox takes no commands. Nothing else in the
+    // sandbox is handed the token.
+    commandServer
+      ? `(while :; do "${COMMAND_SERVER_MOUNT}/command-server-$(uname -m)"; sleep 1; done) </dev/null &\nunset GKE_SANDBOXES_COMMAND_TOKEN GKE_SANDBOXES_COMMAND_PORT\n`
+      : ''
+  }${
     // Its own shell, so that its $$ is the watchdog and not the pod's first process.
     watchdog
       ? // Kubernetes reads `$$` in a command as an escaped `$`, so the script's own are doubled.
@@ -308,6 +338,8 @@ export class GkeSandboxes {
   private readonly manager: Labels;
   private readonly idleTimeoutMs: number;
   private readonly diskBytes: number;
+  private readonly configMaps: string;
+  private commandServer: Promise<void> | undefined;
 
   constructor(
     private readonly kubernetes: KubernetesApi,
@@ -341,6 +373,9 @@ export class GkeSandboxes {
       throw new Error('A manager label and a positive idle timeout are required.');
     this.pods = `/api/v1/namespaces/${namespace}/pods`;
     this.leases = `/apis/coordination.k8s.io/v1/namespaces/${namespace}/leases`;
+    this.configMaps = `/api/v1/namespaces/${namespace}/configmaps`;
+    if (options.directCommands)
+      z.number().int().min(1).max(65535).parse(options.directCommands.port);
     const api = `/apis/podsnapshot.gke.io/v1/namespaces/${namespace}`;
     this.triggers = `${api}/podsnapshotmanualtriggers`;
     this.snapshotsPath = `${api}/podsnapshots`;
@@ -375,7 +410,7 @@ export class GkeSandboxes {
       });
       if (!fresh && !(await this.markAcquired(pod))) continue;
       return {
-        sandbox: this.makeEnvironment(id, 'started', pod.metadata.name),
+        sandbox: this.makeEnvironment(id, 'started', pod),
         startState,
         labels: pod.metadata.labels,
         podName: pod.metadata.name,
@@ -435,7 +470,7 @@ export class GkeSandboxes {
         ...Array.from({ length: Math.max(0, size - keep.size) }, () => {
           const pod = spare(randomUUID());
           pod.metadata.labels = requestedLabels;
-          return this.kubernetes.request('POST', this.pods, pod);
+          return this.createPod(pod);
         }),
       ]);
     };
@@ -498,7 +533,7 @@ export class GkeSandboxes {
           if (!claimed) continue;
           this.report('create', PodSchema.parse(claimed).metadata.labels, pod, startedAt, null);
           return {
-            sandbox: this.makeEnvironment(id, 'started', id),
+            sandbox: this.makeEnvironment(id, 'started', pod),
             podName: id,
             fromPool: true,
             touch: () => this.touch(id),
@@ -785,9 +820,7 @@ export class GkeSandboxes {
         .digest('hex')
         .slice(0, 6)}`;
       try {
-        pod = PodSchema.parse(
-          await this.kubernetes.request('POST', this.pods, this.manifest(sandbox, name, snapshot)),
-        );
+        pod = PodSchema.parse(await this.createPod(this.manifest(sandbox, name, snapshot)));
         created = true;
         break;
       } catch (error) {
@@ -869,12 +902,15 @@ export class GkeSandboxes {
   // replace saved files with an empty filesystem. Keep the snapshot for the next wake.
   private async confirmRestored(pod: Pod, id: string) {
     const path = `${this.pods}/${pod.metadata.name}`;
+    const address = this.commandAddress(pod);
     const check = new TextEncoder().encode(
       `test "$(cat ${quote(SANDBOX_ID_FILE)} 2>/dev/null)" = ${quote(id)}`,
     );
     // GKE fills in the files as the container starts, so the first looks can come too early.
     for (let attempt = 0; attempt < RESTORE_CHECKS; attempt++) {
-      const { exitCode } = await this.kubernetes.exec(path, execCommand(30), check, 30);
+      const { exitCode } = await (address
+        ? directExec(address, execCommand(30), check, 30, {}, true)
+        : this.kubernetes.exec(path, execCommand(30), check, 30));
       if (exitCode === 0) {
         await this.kubernetes.request('PATCH', path, {
           metadata: { annotations: { [RESTORED_ANNOTATION]: 'true' } },
@@ -887,11 +923,49 @@ export class GkeSandboxes {
     throw new Error(`Sandbox ${id} was not restored from its snapshot.`);
   }
 
+  /** Where the pod's command server is, or null for a pod that is reached through the API. */
+  private commandAddress(pod: Pod): CommandServerAddress | null {
+    const { annotations } = pod.metadata;
+    const token = annotations[COMMAND_TOKEN_ANNOTATION];
+    const port = Number(annotations[COMMAND_PORT_ANNOTATION]);
+    return this.options.directCommands && token && port && pod.status.podIP
+      ? { host: pod.status.podIP, port, token }
+      : null;
+  }
+
+  /** Creates a pod, after the command server it mounts, once per process. */
+  private async createPod(manifest: unknown) {
+    if (this.options.directCommands)
+      await (this.commandServer ??= this.kubernetes
+        .request('POST', this.configMaps, {
+          apiVersion: 'v1',
+          kind: 'ConfigMap',
+          metadata: { name: COMMAND_SERVER_CONFIG, labels: this.manager },
+          binaryData: Object.fromEntries(
+            Object.entries(COMMAND_SERVER.binaries).map(([machine, binary]) => [
+              `command-server-${machine}`,
+              binary,
+            ]),
+          ),
+        })
+        .then(
+          () => undefined,
+          (error) => {
+            // Another process, or an earlier run of this one, already published this build.
+            if (error instanceof KubernetesApiError && error.status === 409) return;
+            this.commandServer = undefined;
+            throw error;
+          },
+        ));
+    return this.kubernetes.request('POST', this.pods, manifest);
+  }
+
   private manifest(
     sandbox: Pick<SandboxRecord, 'name' | 'labels'>,
     name: string,
     snapshot: string | undefined,
   ) {
+    const { directCommands } = this.options;
     return {
       apiVersion: 'v1',
       kind: 'Pod',
@@ -907,6 +981,12 @@ export class GkeSandboxes {
           // cannot size the scratch volume at /tmp, so the kubelet's limit still bounds that.
           'dev.gvisor.flag.overlay2': `root:self,size=${this.diskBytes}`,
           ...(snapshot ? { [RESTORE_ANNOTATION]: snapshot } : {}),
+          ...(directCommands
+            ? {
+                [COMMAND_PORT_ANNOTATION]: String(directCommands.port),
+                [COMMAND_TOKEN_ANNOTATION]: randomBytes(32).toString('hex'),
+              }
+            : {}),
         },
       },
       spec: {
@@ -932,6 +1012,14 @@ export class GkeSandboxes {
                 },
               ]
             : []),
+          ...(directCommands
+            ? [
+                {
+                  name: 'command-server',
+                  configMap: { name: COMMAND_SERVER_CONFIG, defaultMode: 0o555 },
+                },
+              ]
+            : []),
         ],
         containers: [
           {
@@ -944,7 +1032,20 @@ export class GkeSandboxes {
               this.options.memoryWatchdog === false
                 ? null
                 : { protect: this.options.memoryWatchdog?.protect ?? [] },
+              !!directCommands,
             ),
+            // The pod's own annotations, so the pod template is the same for every pod.
+            ...(directCommands
+              ? {
+                  env: [
+                    ['GKE_SANDBOXES_COMMAND_TOKEN', COMMAND_TOKEN_ANNOTATION],
+                    ['GKE_SANDBOXES_COMMAND_PORT', COMMAND_PORT_ANNOTATION],
+                  ].map(([name, annotation]) => ({
+                    name,
+                    valueFrom: { fieldRef: { fieldPath: `metadata.annotations['${annotation}']` } },
+                  })),
+                }
+              : {}),
             volumeMounts: [
               { name: 'scratch', mountPath: '/tmp' },
               ...(this.options.runtime
@@ -955,6 +1056,9 @@ export class GkeSandboxes {
                       readOnly: true,
                     },
                   ]
+                : []),
+              ...(directCommands
+                ? [{ name: 'command-server', mountPath: COMMAND_SERVER_MOUNT, readOnly: true }]
                 : []),
             ],
             resources: this.options.resources ?? DEFAULT_RESOURCES,
@@ -1140,7 +1244,7 @@ export class GkeSandboxes {
   private makeEnvironment(
     name: string,
     state: 'started' | 'stopped',
-    firstPod: string | null,
+    firstPod: Pod | null,
   ): SandboxEnvironment {
     // Only the immediate handoff can use the claim directly. A handle kept over I/O
     // may have slept and woken in another pod, even before its first command.
@@ -1148,15 +1252,39 @@ export class GkeSandboxes {
       setImmediate(() => {
         firstPod = null;
       }).unref();
-    const podPath = async () => {
-      if (firstPod) {
-        const path = `${this.pods}/${firstPod}`;
-        firstPod = null;
-        return path;
-      }
-      const pod = await this.livePod(name);
+    // The command server this handle last reached. Its token is the pod's own, so a connection it
+    // accepts is to that pod, and the pod need not be looked up again for every command. A pod
+    // that is gone, or whose address another pod has taken, accepts nothing: the sandbox's pod is
+    // then looked up as for a first command.
+    let reached: CommandServerAddress | null = null;
+    const run = async (
+      command: string[],
+      stdin: Uint8Array,
+      timeout: number,
+      options: ExecOptions = {},
+    ) => {
+      if (reached)
+        try {
+          return await directExec(reached, command, stdin, timeout, options, false);
+        } catch (error) {
+          if (!(error instanceof CommandServerUnreachableError)) throw error;
+          reached = null;
+        }
+      const pod = firstPod ?? (await this.livePod(name));
+      firstPod = null;
       if (!pod) throw new Error(`Sandbox ${name} is not running.`);
-      return `${this.pods}/${pod.metadata.name}`;
+      const address = this.commandAddress(pod);
+      if (!address)
+        return this.kubernetes.exec(
+          `${this.pods}/${pod.metadata.name}`,
+          command,
+          stdin,
+          timeout,
+          options,
+        );
+      const result = await directExec(address, command, stdin, timeout, options, true);
+      reached = address;
+      return result;
     };
     return {
       id: name,
@@ -1172,8 +1300,7 @@ export class GkeSandboxes {
             }),
             command,
           ].join('\n');
-          const { exitCode, output, truncated } = await this.kubernetes.exec(
-            await podPath(),
+          const { exitCode, output, truncated } = await run(
             execCommand(timeout),
             new TextEncoder().encode(script),
             timeout,
@@ -1184,8 +1311,7 @@ export class GkeSandboxes {
       },
       fs: {
         uploadFile: async (local, remote, timeout = 300) => {
-          const { exitCode, output } = await this.kubernetes.exec(
-            await podPath(),
+          const { exitCode, output } = await run(
             ['sh', '-c', 'cat > "$0"', remote],
             await readFile(local),
             timeout,
@@ -1196,13 +1322,16 @@ export class GkeSandboxes {
           const file = createWriteStream(local);
           const errors: Uint8Array[] = [];
           // The file's bytes go straight to disk; only what `cat` complains about is kept.
-          const { exitCode } = await this.kubernetes
-            .exec(await podPath(), ['sh', '-c', 'cat "$0"', remote], new Uint8Array(), timeout, {
+          const { exitCode } = await run(
+            ['sh', '-c', 'cat "$0"', remote],
+            new Uint8Array(),
+            timeout,
+            {
               maxOutputBytes: 0,
               onOutput: (chunk, stream) =>
                 stream === 'stdout' ? file.write(chunk.slice()) : errors.push(chunk.slice()),
-            })
-            .finally(() => file.end());
+            },
+          ).finally(() => file.end());
           await finished(file);
           if (exitCode === 0) return;
           await rm(local, { force: true });

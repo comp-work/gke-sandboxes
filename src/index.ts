@@ -127,7 +127,8 @@ const KEPT_LABEL = 'getenergy.com/kept-snapshot';
 const keptLease = (snapshot: string) => `${snapshot}.kept`;
 // The record that a new sandbox's id is taken, and by which pod, while that pod may not carry the
 // sandbox's labels yet. Pod names never contain a dot, so it can share no name with a pod's Lease.
-const identityLease = (id: string) => `${id}.sandbox`;
+const IDENTITY_SUFFIX = '.sandbox';
+const identityLease = (id: string) => `${id}${IDENTITY_SUFFIX}`;
 // A pod is named after the snapshot it starts from. Kubernetes creates a name once, so callers that
 // start a sandbox at the same moment get one pod between them.
 const podNameFor = (id: string, snapshot: string | undefined) =>
@@ -140,6 +141,9 @@ const labelPath = (key: string) =>
   `/metadata/labels/${key.replaceAll('~', '~0').replaceAll('/', '~1')}`;
 // A pool pod that its claimer has not yet labelled is labelled by the pool's maintainer after this.
 const ADOPT_AFTER_MS = 30_000;
+// A pool pod taken but never handed out is removed after this: the hand-out's command alone may take
+// 30 seconds.
+const HAND_OUT_ABANDONED_MS = 120_000;
 // What a pod's command server listens on and accepts. Only the pod's own record holds the token,
 // so a caller that reads the pod can reach it and a neighbouring pod cannot.
 const COMMAND_PORT_ANNOTATION = 'getenergy.com/command-port';
@@ -546,26 +550,29 @@ export class GkeSandboxes {
           ),
         )
         .items.filter((pod) => !terminating(pod));
-    // A pool pod with a Lease named after it is taken: by a sandbox, or by a maintainer removing it.
-    const claims = async () =>
-      new Map(
-        listOf(LeaseSchema)
-          .parse(
-            await this.kubernetes.request(
-              'GET',
-              `${this.leases}?labelSelector=${this.selector({})}`,
-            ),
-          )
-          .items.map((lease) => [lease.metadata.name, lease]),
+    // A pool pod with a Lease named after it is taken: by a caller handing it out, or by a
+    // maintainer removing it. It is handed out once a record names it as a sandbox's pod.
+    const claims = async () => {
+      const { items } = listOf(LeaseSchema).parse(
+        await this.kubernetes.request('GET', `${this.leases}?labelSelector=${this.selector({})}`),
       );
-    const takeLease = (pod: Pod, holder: string, labels: Labels) =>
+      return {
+        taken: new Map(items.map((lease) => [lease.metadata.name, lease])),
+        handedOut: new Map(
+          items
+            .filter(({ metadata }) => metadata.name.endsWith(IDENTITY_SUFFIX))
+            .map((lease) => [lease.spec.holderIdentity ?? '', lease]),
+        ),
+      };
+    };
+    const takeLease = (pod: Pod, holder: string) =>
       this.kubernetes
         .request('POST', this.leases, {
           apiVersion: 'coordination.k8s.io/v1',
           kind: 'Lease',
           metadata: {
             name: pod.metadata.name,
-            labels,
+            labels: this.manager,
             ownerReferences: [
               { apiVersion: 'v1', kind: 'Pod', name: pod.metadata.name, uid: pod.metadata.uid },
             ],
@@ -579,13 +586,15 @@ export class GkeSandboxes {
             throw error;
           },
         );
+    const age = (lease: Lease | undefined) =>
+      Date.now() - (Date.parse(lease?.spec.acquireTime ?? '') || Date.now());
 
     // One maintainer per named pool; claims can come from any replica. A spare is removed only
     // after the maintainer has taken its Lease, so a pod being handed out is never deleted.
     const reconcile = async (size: number) => {
       z.number().int().nonnegative().parse(size);
-      const [idle, leases] = await Promise.all([spares(poolLabels), claims()]);
-      const free = idle.filter((pod) => !leases.has(pod.metadata.name));
+      const [idle, { taken, handedOut }] = await Promise.all([spares(poolLabels), claims()]);
+      const free = idle.filter((pod) => !taken.has(pod.metadata.name));
       const usable = free
         .filter(
           (pod) =>
@@ -595,18 +604,22 @@ export class GkeSandboxes {
         .sort(oldestLiveFirst);
       const keep = new Set(usable.slice(0, size).map((pod) => pod.metadata.uid));
       await Promise.all([
-        // A sandbox whose claimer stopped before it labelled the pod.
         ...idle.map((pod) => {
-          const lease = leases.get(pod.metadata.name);
-          const acquired = Date.parse(lease?.spec.acquireTime ?? '');
-          return lease?.metadata.labels[SANDBOX_LABEL] && Date.now() - acquired > ADOPT_AFTER_MS
-            ? this.adopt(pod.metadata.name, lease.metadata.labels)
+          const { name } = pod.metadata;
+          const record = handedOut.get(name);
+          // Handed out, but its caller stopped before it labelled the pod.
+          if (record)
+            return age(record) > ADOPT_AFTER_MS ? this.adopt(name, record.metadata.labels) : null;
+          // Taken by a caller, or a maintainer, that stopped before it finished. A caller may have
+          // given it an id file and a service, so it is not put back.
+          return taken.has(name) && age(taken.get(name)) > HAND_OUT_ABANDONED_MS
+            ? this.kubernetes.request('DELETE', `${this.pods}/${name}`)
             : null;
         }),
         ...free
           .filter((pod) => !keep.has(pod.metadata.uid))
           .map(async (pod) => {
-            if (await takeLease(pod, '', this.manager))
+            if (await takeLease(pod, ''))
               await this.kubernetes.request('DELETE', `${this.pods}/${pod.metadata.name}`);
           }),
         ...Array.from({ length: Math.max(0, size - keep.size) }, () => {
@@ -621,21 +634,25 @@ export class GkeSandboxes {
     // shows it taken, so that callers in this process try different pods.
     let reading: Promise<Pod[]> | undefined;
     const reserved = new Set<string>();
-    const available = async () => {
-      const [pods, leases] = await Promise.all([spares(requestedLabels), claims()]);
-      const free = pods.filter(
-        (pod) =>
-          pod.status.phase === 'Running' &&
-          ready(pod.status.conditions) &&
-          !leases.has(pod.metadata.name),
-      );
-      const listed = new Set(free.map((pod) => pod.metadata.name));
-      for (const pod of reserved) if (!listed.has(pod)) reserved.delete(pod);
-      // Replicas see the same list. Varying their first choice spares them conflicts; the Lease
-      // still decides which caller gets a pod.
-      const offset = free.length ? randomInt(free.length) : 0;
-      return free.slice(offset).concat(free.slice(0, offset));
-    };
+    const available = () =>
+      (reading ??= Promise.all([spares(requestedLabels), claims()])
+        .then(([pods, { taken }]) => {
+          const free = pods.filter(
+            (pod) =>
+              pod.status.phase === 'Running' &&
+              ready(pod.status.conditions) &&
+              !taken.has(pod.metadata.name),
+          );
+          const listed = new Set(free.map((pod) => pod.metadata.name));
+          for (const pod of reserved) if (!listed.has(pod)) reserved.delete(pod);
+          // Replicas see the same list. Varying their first choice spares them conflicts; the
+          // Lease still decides which caller gets a pod.
+          const offset = free.length ? randomInt(free.length) : 0;
+          return free.slice(offset).concat(free.slice(0, offset));
+        })
+        .finally(() => {
+          reading = undefined;
+        }));
     const checkLabels = (labels: Labels) => {
       labelSchema.parse(labels);
       for (const key of [
@@ -649,14 +666,17 @@ export class GkeSandboxes {
     };
 
     // Hands out a spare as the sandbox `id`, or as one named after its pod when `id` is null.
-    // Returns null when the pool has nothing ready, and 'taken' when another caller is creating
-    // `id` at the same moment.
-    const claim = async (id: string | null, labels: Labels, signal: AbortSignal) => {
+    // Returns null when the pool has nothing ready, and 'taken' when another caller created `id`
+    // at the same moment. Nothing but this caller sees the pod as the sandbox until the record of
+    // the hand-out exists, which is written last.
+    const claim = async (
+      id: string | null,
+      labels: Labels,
+      signal: AbortSignal,
+      listed: Promise<Pod[]>,
+    ) => {
       const startedAt = Date.now();
-      reading ??= available().finally(() => {
-        reading = undefined;
-      });
-      const pods = await reading;
+      const pods = [...(await listed)];
       while (pods.length) {
         signal.throwIfAborted();
         const pod = pods.pop()!;
@@ -664,24 +684,23 @@ export class GkeSandboxes {
         if (reserved.has(podName)) continue;
         reserved.add(podName);
         const sandboxId = id ?? podName;
+        if (!(await takeLease(pod, sandboxId))) continue;
+        // A maintainer that removed the pod first held its Lease until the pod went, and Kubernetes
+        // then deleted that Lease too, so the pod may be gone or shutting down by now.
+        const current = await this.kubernetes.request('GET', `${this.pods}/${podName}`);
+        if (!current || terminating(PodSchema.parse(current))) continue;
         const sandboxLabels = {
           ...labels,
           ...this.manager,
           [SANDBOX_LABEL]: sandboxId,
           [CREATED_LABEL]: String(Date.now()),
         };
-        if (!(await takeLease(pod, sandboxId, sandboxLabels))) continue;
-        const named = sandboxId !== podName;
-        if (named && (await this.takeIdentity(sandboxId, pod)) !== null) {
-          // Another caller is creating the sandbox; the pod goes back to the pool.
-          await this.kubernetes.request('DELETE', `${this.leases}/${podName}`);
-          return 'taken' as const;
-        }
+        // The pod recorded its own name as the sandbox it holds, and started no service, because
+        // it started before either was known.
+        const boot = this.options.boot?.(sandboxLabels);
+        const prepare = sandboxId !== podName || !!boot;
         try {
-          // The pod recorded its own name as the sandbox it holds, and started no service, because
-          // it started before either was known.
-          const boot = this.options.boot?.(sandboxLabels);
-          if (named || boot) {
+          if (prepare) {
             const { exitCode, output } = await this.runIn(
               pod,
               [
@@ -696,21 +715,26 @@ export class GkeSandboxes {
             );
             if (exitCode !== 0) throw new Error(`Could not hand out pod ${podName}: ${output}`);
           }
+          if (!(await this.recordHandOut(sandboxId, pod, sandboxLabels))) {
+            reserved.delete(podName);
+            // A prepared pod holds this id and its service, so it cannot go back to the pool.
+            await this.kubernetes.request(
+              'DELETE',
+              prepare ? `${this.pods}/${podName}` : `${this.leases}/${podName}`,
+            );
+            return 'taken' as const;
+          }
         } catch (error) {
           this.report('create', sandboxLabels, pod, startedAt, error);
-          // Without its id file the sandbox could not be woken later; the pod is not used.
-          await Promise.all([
-            named &&
-              this.kubernetes.request('DELETE', `${this.leases}/${identityLease(sandboxId)}`),
-            this.kubernetes.request('DELETE', `${this.pods}/${podName}`),
-          ]);
+          reserved.delete(podName);
+          await this.kubernetes.request('DELETE', `${this.pods}/${podName}`);
           continue;
         }
         // Off the caller's path: a pod write passes the admission webhook. A failure is retried
         // before the sandbox's first snapshot and by the pool's maintainer.
         this.adopt(podName, sandboxLabels).catch(() => undefined);
         this.report('create', sandboxLabels, pod, startedAt, null);
-        pod.metadata.labels = { ...pod.metadata.labels, ...sandboxLabels };
+        pod.metadata.labels = { ...sandboxLabels, ...pod.metadata.labels };
         return {
           sandbox: this.makeEnvironment(sandboxId, 'started', pod),
           labels: sandboxLabels,
@@ -732,8 +756,11 @@ export class GkeSandboxes {
         sandboxIdSchema.parse(id);
         checkLabels(labels);
         signal.throwIfAborted();
+        // Both lists at once: the spares are only needed if the sandbox is new.
+        const listed = available();
+        listed.catch(() => undefined);
         const found = await sandboxes.find(id);
-        const claimed = found ? null : await claim(id, labels, signal);
+        const claimed = found ? null : await claim(id, labels, signal, listed);
         if (claimed && claimed !== 'taken')
           return { ...claimed, startState: 'missing' as const, fromPool: true };
         // Taken by another caller at the same moment: the lookup now finds its pod.
@@ -747,7 +774,7 @@ export class GkeSandboxes {
       async create(signal: AbortSignal, labels: Labels = {}) {
         checkLabels(labels);
         signal.throwIfAborted();
-        const claimed = await claim(null, labels, signal);
+        const claimed = await claim(null, labels, signal, available());
         if (claimed && claimed !== 'taken') return { ...claimed, fromPool: true };
         const { sandbox, podName, touch } = await sandboxes.acquire(randomUUID(), signal, labels);
         return { sandbox, podName, touch, fromPool: false };
@@ -950,6 +977,19 @@ export class GkeSandboxes {
     if (!Object.keys(match).some((key) => !(key in this.manager)))
       throw new Error('A deletion selector is required.');
     const labels = this.selector(match);
+    // A pool pod handed out moments ago may not carry the labels yet; the record of it does.
+    const { items } = listOf(LeaseSchema).parse(
+      await this.kubernetes.request('GET', `${this.leases}?labelSelector=${labels}`),
+    );
+    await Promise.all(
+      items
+        .filter(
+          ({ metadata, spec }) => metadata.name.endsWith(IDENTITY_SUFFIX) && spec.holderIdentity,
+        )
+        .map(({ spec }) =>
+          this.kubernetes.request('DELETE', `${this.pods}/${spec.holderIdentity}`),
+        ),
+    );
     await Promise.all(
       [this.pods, this.snapshotsPath, this.triggers, this.leases].map((path) =>
         this.kubernetes.request('DELETE', `${path}?labelSelector=${labels}`),
@@ -987,15 +1027,17 @@ export class GkeSandboxes {
     // A woken sandbox gets a new pod while its previous one may still be shutting down.
     for (const pod of listOf(PodSchema).parse(pods).items.sort(oldestLiveFirst).reverse())
       sandbox(pod.metadata).pod = pod;
-    // A pool pod handed out moments ago may not carry its sandbox's labels yet; its Lease does.
+    // A pool pod handed out moments ago may not carry its sandbox's labels yet; the record of the
+    // hand-out does.
     const unlabelled = listOf(LeaseSchema)
       .parse(leases)
       .items.filter(
         ({ metadata }) =>
-          !metadata.name.includes('.') && !sandboxes.get(metadata.labels[SANDBOX_LABEL]!)?.pod,
+          metadata.name.endsWith(IDENTITY_SUFFIX) &&
+          !sandboxes.get(metadata.labels[SANDBOX_LABEL]!)?.pod,
       );
     for (const pod of await Promise.all(unlabelled.map((lease) => this.claimedPod(lease))))
-      if (pod) sandbox(pod.metadata).pod = pod;
+      if (pod && POOL_LABEL in pod.metadata.labels) sandbox(pod.metadata).pod = pod;
     for (const snapshot of listOf(SnapshotSchema)
       .parse(snapshots)
       .items.filter(({ status }) => ready(status.conditions))
@@ -1017,59 +1059,73 @@ export class GkeSandboxes {
       await this.kubernetes.request('GET', `${this.pods}${query}`),
     );
     if (items.length) return items;
-    // A pool pod handed out moments ago may not carry its sandbox's labels yet; its Lease does.
+    // A pool pod handed out moments ago may not carry its sandbox's labels yet; the record of the
+    // hand-out does.
     const leases = listOf(LeaseSchema).parse(
       await this.kubernetes.request('GET', `${this.leases}${query}`),
     );
     const pods = await Promise.all(
       leases.items
-        .filter(({ metadata }) => !metadata.name.includes('.'))
+        .filter(({ metadata }) => metadata.name.endsWith(IDENTITY_SUFFIX))
         .map((lease) => this.claimedPod(lease)),
     );
-    return pods.filter((pod) => pod !== null);
+    return pods.filter((pod): pod is Pod => pod !== null && POOL_LABEL in pod.metadata.labels);
   }
 
   /**
-   * The pool pod a Lease handed out, with the labels of the sandbox it became if it does not carry
-   * them yet. It keeps its pool label until it does, which is how a snapshot knows to label it.
+   * The pod a sandbox's id record names, with the sandbox's labels from the record if it is a pool
+   * pod that does not carry them yet. It keeps its pool label until it does, which is how a
+   * snapshot knows to label it first.
    */
-  private async claimedPod(lease: Lease) {
-    const found = await this.kubernetes.request('GET', `${this.pods}/${lease.metadata.name}`);
+  private async claimedPod(record: Lease) {
+    const holder = record.spec.holderIdentity;
+    const found = holder ? await this.kubernetes.request('GET', `${this.pods}/${holder}`) : null;
     if (!found) return null;
     const pod = PodSchema.parse(found);
     if (POOL_LABEL in pod.metadata.labels)
-      pod.metadata.labels = { ...pod.metadata.labels, ...lease.metadata.labels };
+      pod.metadata.labels = { ...record.metadata.labels, ...pod.metadata.labels };
     return pod;
   }
 
   /**
-   * Records that the new sandbox `id` is the holder's. Returns null when it is. Otherwise it returns
-   * the pool pod another caller handed out as `id`, which is then this caller's too, or 'starting'
-   * when another caller is starting a new pod for it. A record left by a holder that is gone is
-   * replaced.
+   * Records that a pool pod was handed out as the sandbox `id`. Returns false when another caller
+   * created `id` first. The record goes with the pod.
    */
-  private async takeIdentity(id: string, holder: Pod | string): Promise<Pod | 'starting' | null> {
+  private async recordHandOut(id: string, pod: Pod, labels: Labels) {
+    try {
+      await this.kubernetes.request('POST', this.leases, {
+        apiVersion: 'coordination.k8s.io/v1',
+        kind: 'Lease',
+        metadata: {
+          name: identityLease(id),
+          labels,
+          ownerReferences: [
+            { apiVersion: 'v1', kind: 'Pod', name: pod.metadata.name, uid: pod.metadata.uid },
+          ],
+        },
+        spec: { holderIdentity: pod.metadata.name, acquireTime: leaseTime() },
+      });
+      return true;
+    } catch (error) {
+      if (error instanceof KubernetesApiError && error.status === 409) return false;
+      throw error;
+    }
+  }
+
+  /**
+   * Records that the new sandbox `id` is the pod `podName`'s, before that pod is created. Returns
+   * null when it is, or the pool pod another caller already handed out as `id`, which is then this
+   * caller's too. A record whose pod is gone or has failed is replaced.
+   */
+  private async takeIdentity(id: string, podName: string): Promise<Pod | null> {
     const name = identityLease(id);
-    const holderName = typeof holder === 'string' ? holder : holder.metadata.name;
     while (true) {
       try {
         await this.kubernetes.request('POST', this.leases, {
           apiVersion: 'coordination.k8s.io/v1',
           kind: 'Lease',
-          metadata: {
-            name,
-            labels: { ...this.manager, [SANDBOX_LABEL]: id },
-            // A pool pod's record goes with the pod. A new pod's own is named after the sandbox,
-            // so a record it leaves behind is its successor's too.
-            ...(typeof holder === 'string'
-              ? {}
-              : {
-                  ownerReferences: [
-                    { apiVersion: 'v1', kind: 'Pod', name: holderName, uid: holder.metadata.uid },
-                  ],
-                }),
-          },
-          spec: { holderIdentity: holderName, acquireTime: leaseTime() },
+          metadata: { name, labels: { ...this.manager, [SANDBOX_LABEL]: id } },
+          spec: { holderIdentity: podName, acquireTime: leaseTime() },
         });
         return null;
       } catch (error) {
@@ -1077,17 +1133,14 @@ export class GkeSandboxes {
       }
       const found = await this.kubernetes.request('GET', `${this.leases}/${name}`);
       if (!found) continue;
-      const lease = LeaseSchema.parse(found);
-      const current = lease.spec.holderIdentity ?? '';
-      if (current === holderName) return null;
-      // Another caller is starting a new pod for `id`, and the pool claimer gives way to it.
-      if (current === podNameFor(id, undefined)) return 'starting';
-      const claimLease = await this.kubernetes.request('GET', `${this.leases}/${current}`);
-      const pod = claimLease ? await this.claimedPod(LeaseSchema.parse(claimLease)) : null;
-      if (pod && !terminating(pod)) return pod;
+      const record = LeaseSchema.parse(found);
+      // Another caller starting the same pod, whose name it then shares.
+      if (record.spec.holderIdentity === podName) return null;
+      const pod = await this.claimedPod(record);
+      if (pod && !terminating(pod) && ['Running', 'Pending'].includes(pod.status.phase)) return pod;
       await this.kubernetes
         .request('DELETE', `${this.leases}/${name}`, {
-          preconditions: { resourceVersion: lease.metadata.resourceVersion },
+          preconditions: { resourceVersion: record.metadata.resourceVersion },
         })
         .catch((error) => {
           if (!(error instanceof KubernetesApiError && error.status === 409)) throw error;
@@ -1114,12 +1167,8 @@ export class GkeSandboxes {
           );
           try {
             await this.kubernetes.request('PATCH', path, [
-              // The pod as it was read, so a label set in between is not overwritten.
-              {
-                op: 'test',
-                path: '/metadata/resourceVersion',
-                value: pod.metadata.resourceVersion,
-              },
+              // The labels as they were read, so one set in between is not overwritten.
+              { op: 'test', path: '/metadata/labels', value: pod.metadata.labels },
               { op: 'remove', path: labelPath(POOL_LABEL) },
               ...(TEMPLATE_LABEL in pod.metadata.labels
                 ? [{ op: 'remove', path: labelPath(TEMPLATE_LABEL) }]
@@ -1133,7 +1182,7 @@ export class GkeSandboxes {
               throw error;
           }
         }
-        throw new Error(`Pod ${podName} kept changing while it was labelled.`);
+        throw new Error(`Pod ${podName}'s labels kept changing while it was labelled.`);
       });
     this.adopting.set(podName, running);
     running
@@ -1162,8 +1211,9 @@ export class GkeSandboxes {
     sandbox: SandboxRecord,
     signal: AbortSignal,
     initialLabels: Labels,
-    base: ForkSource | undefined,
+    fork: ForkSource | undefined,
   ) {
+    let base = fork;
     const id = sandbox.name;
     let pod = sandbox.pod;
     // A sandbox started from another's snapshot starts from it again until it has one of its own.
@@ -1194,6 +1244,10 @@ export class GkeSandboxes {
         const [listed] = await this.list({ [SANDBOX_LABEL]: id });
         const current =
           listed?.labels[CREATED_LABEL] === sandbox.labels[CREATED_LABEL] ? listed : undefined;
+        // A fork that has no snapshot of its own yet starts from its source's again.
+        const { [RESTORE_ANNOTATION]: restored, [FORK_SOURCE_ANNOTATION]: sourceId } =
+          pod.metadata.annotations;
+        if (restored && sourceId) base ??= { name: restored, sourceId };
         snapshot = current?.snapshots[0] ?? base?.name;
         if (!terminating(pod)) {
           // Everything written since that snapshot is gone with the pod. The report comes before
@@ -1224,14 +1278,14 @@ export class GkeSandboxes {
       if (pod) break;
       // A fresh filesystem must also get the caller's initial labels.
       const forked = !!base && snapshot === base.name;
-      if (!snapshot || forked) sandbox.labels = initialLabels;
+      if (!snapshot || (forked && !sandbox.labels[SANDBOX_LABEL])) sandbox.labels = initialLabels;
       // A wake never waits for the pod it replaces to finish shutting down, which started from an
       // earlier snapshot and so has another name.
       const name = podNameFor(id, snapshot);
       if (!snapshot) {
         // A warm pool may be handing out a pod as this sandbox at the same moment.
         const holder = await this.takeIdentity(id, name);
-        if (holder && holder !== 'starting') {
+        if (holder) {
           pod = holder;
           break;
         }
@@ -1241,11 +1295,18 @@ export class GkeSandboxes {
           await this.createPod(
             this.manifest(sandbox, name, snapshot, {
               boot: true,
-              forkedFrom: forked ? base.sourceId : undefined,
+              forkedFrom: forked ? base?.sourceId : undefined,
             }),
           ),
         );
         created = true;
+        // The record of its id now goes with the pod.
+        if (!snapshot)
+          await this.kubernetes.request('PATCH', `${this.leases}/${identityLease(id)}`, {
+            metadata: {
+              ownerReferences: [{ apiVersion: 'v1', kind: 'Pod', name, uid: pod.metadata.uid }],
+            },
+          });
         break;
       } catch (error) {
         if (!(error instanceof KubernetesApiError && error.status === 409)) throw error;

@@ -152,6 +152,15 @@ const cluster = (
           } else {
             resources.delete(resource.metadata.name);
             announce(kind, 'DELETED', resource);
+            // Kubernetes deletes what the pod owns.
+            if (kind === 'pods')
+              for (const lease of [...kinds.leases!.values()])
+                if (
+                  (lease.metadata as { ownerReferences?: { uid: string }[] }).ownerReferences?.some(
+                    ({ uid }) => uid === resource.metadata.uid,
+                  )
+                )
+                  kinds.leases!.delete(lease.metadata.name);
           }
         }
       return {};
@@ -176,6 +185,14 @@ const cluster = (
           path: string;
           value: string;
         }[];
+        // A test of all of the labels compares them as a whole.
+        const whole = operations.find(({ path }) => path === '/metadata/labels');
+        if (
+          whole &&
+          JSON.stringify(Object.entries(whole.value).sort()) !==
+            JSON.stringify(Object.entries(resource.metadata.labels).sort())
+        )
+          throw new KubernetesApiError(422, 'Test failed');
         const target = ({ path }: { path: string }) => {
           if (path === '/metadata/resourceVersion')
             return {
@@ -186,8 +203,9 @@ const cluster = (
           const values = resource.metadata[group as 'labels' | 'annotations'];
           return { values, field: field!.replaceAll('~1', '/').replaceAll('~0', '~') };
         };
+        const fields = operations.filter(({ path }) => path !== '/metadata/labels');
         if (
-          operations.some((operation) => {
+          fields.some((operation) => {
             const { values, field } = target(operation);
             return (
               (operation.op === 'test' && values[field] !== operation.value) ||
@@ -196,7 +214,7 @@ const cluster = (
           })
         )
           throw new KubernetesApiError(422, 'Test failed');
-        for (const operation of operations) {
+        for (const operation of fields) {
           const { values, field } = target(operation);
           if (operation.op === 'remove') delete values[field];
           else if (operation.op !== 'test') values[field] = operation.value;
@@ -207,6 +225,8 @@ const cluster = (
       }
       if (kind === 'leases') {
         resource.spec = { ...resource.spec, ...input.spec };
+        const { ownerReferences } = (input.metadata ?? {}) as { ownerReferences?: unknown };
+        if (ownerReferences) Object.assign(resource.metadata, { ownerReferences });
         return resource;
       }
       Object.assign(resource.metadata.labels, input.metadata.labels);
@@ -1080,6 +1100,13 @@ test("the pool's maintainer keeps handed-out pods, and removes a spare only once
   // A sandbox handed out while the maintainer shrinks the pool is never deleted under it.
   await pool.reconcile(1);
   const [raced] = await Promise.all([pool.acquire('raced', signal), pool.reconcile(0)]);
+  console.log(
+    'DBG',
+    raced.podName,
+    raced.fromPool,
+    [...kinds.pods!.keys()],
+    [...kinds.leases!.keys()],
+  );
   expect(kinds.pods!.get(raced.podName)?.status).toMatchObject({ phase: 'Running' });
 });
 
@@ -1157,4 +1184,70 @@ test('capabilities are added to the sandbox container', async () => {
   expect(specOf(ID)).toMatchObject({
     containers: [{ securityContext: { capabilities: { add: ['NET_ADMIN', 'SYS_ADMIN'] } } }],
   });
+});
+
+test('deleting a sandbox handed out moments ago removes its pod, which does not return to the pool', async () => {
+  const { backend, request, kinds } = cluster({ drainStatus: 0, restores: true });
+  const writes = Promise.withResolvers<void>();
+  const sandboxes = backend({
+    request: async (method, path, body) => {
+      if (isPodWrite(method, path)) await writes.promise;
+      return request(method, path, body);
+    },
+  });
+  const pool = sandboxes.warmPool('agents');
+  await pool.reconcile(1);
+  const { podName } = await pool.acquire(ID, signal);
+  await sandboxes.delete(ID);
+  writes.resolve();
+  await Bun.sleep(10);
+  expect([kinds.pods!.has(podName), await sandboxes.find(ID)]).toEqual([false, null]);
+});
+
+test('a pool pod taken but never handed out is removed, and nothing finds it meanwhile', async () => {
+  const { backend, kinds } = cluster({ drainStatus: 0, restores: true });
+  const sandboxes = backend();
+  const pool = sandboxes.warmPool('agents');
+  await pool.reconcile(2);
+  const [taken, retired] = [...kinds.pods!.values()];
+  // A caller that stopped after taking a pod, and a maintainer that stopped before deleting one.
+  const lease = (pod: typeof taken, holder: string, acquiredMs: number) =>
+    kinds.leases!.set(pod!.metadata.name, {
+      metadata: {
+        name: pod!.metadata.name,
+        uid: crypto.randomUUID(),
+        resourceVersion: '1',
+        creationTimestamp: '',
+        labels: { 'app.kubernetes.io/managed-by': 'gke-sandboxes' },
+        annotations: {},
+      },
+      spec: { holderIdentity: holder, acquireTime: new Date(acquiredMs).toISOString() },
+      status: {},
+    });
+  lease(taken, ID, Date.now());
+  lease(retired!, '', Date.now() - 10 * 60_000);
+  expect(await sandboxes.find(ID)).toBeNull();
+  await pool.reconcile(0);
+  // The recent one may still be handed out; the old one is removed.
+  expect([kinds.pods!.has(taken!.metadata.name), kinds.pods!.has(retired!.metadata.name)]).toEqual([
+    true,
+    false,
+  ]);
+  kinds.leases!.get(taken!.metadata.name)!.spec!.acquireTime = new Date(
+    Date.now() - 10 * 60_000,
+  ).toISOString();
+  await pool.reconcile(0);
+  expect(kinds.pods!.has(taken!.metadata.name)).toBe(false);
+});
+
+test('a fork whose pod is lost before its first snapshot starts from its source again', async () => {
+  const { sandboxes, filesOf, pod, change } = cluster({ drainStatus: 0, restores: true });
+  const { sandbox } = await sandboxes.acquire(ID, signal);
+  await sandbox.process.executeCommand("printf %s 'kept' > '/home/notes'");
+  const kept = await sandboxes.snapshot(ID);
+  await sandboxes.acquire('fork-1', signal, {}, { from: kept });
+  change(pod('fork-1'), { phase: 'Failed', reason: 'Evicted' });
+  await sandboxes.acquire('fork-1', signal);
+  expect(filesOf('fork-1').has('/home/notes=kept')).toBe(true);
+  expect(filesOf('fork-1').has(`${ID_FILE}=fork-1`)).toBe(true);
 });

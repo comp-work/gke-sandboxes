@@ -64,10 +64,7 @@ test('a caller-supplied image and ID work with the standalone snapshot and netwo
       if (request.method === 'GET' && searchParams.has('labelSelector'))
         return Response.json({ items: [] });
       // A new sandbox records that its id is taken.
-      if (
-        request.method === 'POST' &&
-        pathname === '/apis/coordination.k8s.io/v1/namespaces/sandboxes/leases'
-      )
+      if (pathname.startsWith('/apis/coordination.k8s.io/v1/namespaces/sandboxes/leases'))
         return Response.json(await request.json());
       return new Response('Unexpected request', { status: 400 });
     },

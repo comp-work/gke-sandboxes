@@ -3,7 +3,7 @@ kind: Namespace
 metadata:
   name: sandboxes
   labels:
-    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce: ${pod_security_level}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -79,7 +79,7 @@ spec:
   selector:
     matchLabels:
       app.kubernetes.io/managed-by: gke-sandboxes
-  snapshotScope: rootfs-only
+  snapshotScope: ${snapshot_scope}
   triggerConfig:
     type: manual
     postCheckpoint: resume
@@ -102,9 +102,11 @@ rules:
   - apiGroups: ['']
     resources: [pods/exec]
     verbs: [get, create]
+  # A Lease named after a pod keeps it awake and hands out a warm pool's pods. Others record which
+  # pod holds a new sandbox, and which snapshots snapshot(id) kept.
   - apiGroups: [coordination.k8s.io]
     resources: [leases]
-    verbs: [get, list, create, patch]
+    verbs: [get, list, create, patch, delete, deletecollection]
   # With `directCommands`, the client publishes the sandboxes' command server as a ConfigMap.
   - apiGroups: ['']
     resources: [configmaps]

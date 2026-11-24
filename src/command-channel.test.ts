@@ -244,6 +244,9 @@ const cluster = (podAnnotations: (created: Record<string, string>) => Record<str
     request: async (method: string, path: string, body?: any) => {
       requests.push({ method, path, body });
       if (path.includes('/podsnapshots')) return { items: [] };
+      // No Leases: the pods carry their labels.
+      if (path.includes('/leases'))
+        return method === 'GET' ? (path.includes('?') ? { items: [] } : null) : {};
       if (path.endsWith('/configmaps')) return {};
       if (method === 'GET') return { items: [...pods.values()] };
       if (method === 'PATCH') return pods.get(path.split('/').at(-1)!);

@@ -6,7 +6,7 @@ A 2 vCPU / 4 GB sandbox costs about **1.9¢ for each hour it is awake**, cluster
 
 <picture>
   <source media="(max-width: 600px)" srcset="docs/assets/running-sandbox.png">
-  <img src="docs/assets/running-sandbox-wide.png" width="100%" alt="Cost in US cents for each hour a 2 vCPU and 4 GB sandbox is awake, at about 4% CPU. gke-sandboxes costs an estimated 1.9¢, the whole cluster bill divided by the hours its sandboxes are awake (1×). At list price for compute, Modal 3.5¢ (1.8×), Fly.io 9.2¢ (4.7×), Vercel Sandbox 9.5¢ (4.9×), Daytona 16.6¢ (8.5×), and E2B 16.6¢ (8.5×). Managed disk and plan fees are extra.">
+  <img src="docs/assets/running-sandbox-wide.png" width="100%" alt="Cost in US cents for each hour a sandbox that may use up to 2 vCPU and 4 GB is awake, at about 4% CPU. gke-sandboxes costs an estimated 1.9¢, the whole cluster bill divided by the hours its sandboxes are awake (1×). At list price for compute, Modal 3.5¢ (1.8×), Fly.io 9.2¢ (4.7×), Vercel Sandbox 9.5¢ (4.9×), Daytona 16.6¢ (8.5×), and E2B 16.6¢ (8.5×). Managed disk and plan fees are extra.">
 </picture>
 
 ## Set it up

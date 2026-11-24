@@ -14,6 +14,7 @@ type Resource = {
     labels: Record<string, string>;
     annotations: Record<string, string>;
   };
+  spec?: { renewTime?: string };
   status: Record<string, unknown>;
 };
 
@@ -53,6 +54,7 @@ const cluster = (options: { drainStatus: 0 | 3; restores: boolean }) => {
   const watches = new Map<Watch, () => void>();
   const kinds: Record<string, Map<string, Resource>> = {
     pods: new Map(),
+    leases: new Map(),
     podsnapshots: new Map(),
     podsnapshotmanualtriggers: new Map(),
   };
@@ -117,9 +119,8 @@ const cluster = (options: { drainStatus: 0 | 3; restores: boolean }) => {
       );
   const request: KubernetesApi['request'] = async (method, path, body) => {
     const [location, query = ''] = path.split('?');
-    const [, kind = '', name] = /\/(pods|podsnapshots|podsnapshotmanualtriggers)(?:\/(.+))?$/.exec(
-      location!,
-    )!;
+    const [, kind = '', name] =
+      /\/(pods|leases|podsnapshots|podsnapshotmanualtriggers)(?:\/(.+))?$/.exec(location!)!;
     const resources = kinds[kind]!;
     // A response is what the resource was when it was read.
     if (method === 'GET' && !name)
@@ -146,7 +147,7 @@ const cluster = (options: { drainStatus: 0 | 3; restores: boolean }) => {
     }
     const input = body as {
       metadata: Partial<Resource['metadata']> & { name: string };
-      spec?: { targetPod: string; containers?: { command: string[] }[] };
+      spec?: { targetPod: string; containers?: { command: string[] }[]; renewTime?: string };
     };
     if (method === 'PATCH') {
       const resource = resources.get(name!);
@@ -177,6 +178,10 @@ const cluster = (options: { drainStatus: 0 | 3; restores: boolean }) => {
         announce(kind, 'MODIFIED', resource);
         return resource;
       }
+      if (kind === 'leases') {
+        resource.spec = { ...resource.spec, ...input.spec };
+        return resource;
+      }
       Object.assign(resource.metadata.labels, input.metadata.labels);
       for (const [annotation, value] of Object.entries(input.metadata.annotations ?? {}))
         if (value === null) delete resource.metadata.annotations[annotation];
@@ -197,6 +202,7 @@ const cluster = (options: { drainStatus: 0 | 3; restores: boolean }) => {
       },
       status: {},
     };
+    if (kind === 'leases') resource.spec = { renewTime: input.spec!.renewTime };
     resources.set(resource.metadata.name, resource);
     if (kind === 'pods') {
       specs.set(resource.metadata.name, input.spec);
@@ -392,6 +398,52 @@ test('a sandbox reported as in use stays awake', async () => {
   await created.touch();
   await sandboxes.sleepUnused();
   expect(awake()).toEqual([ID]);
+});
+
+test("a report of use renews the pod's lease and leaves the pod unwritten", async () => {
+  const { sandboxes, kinds, pod, awake } = cluster({ drainStatus: 0, restores: true });
+  const created = await sandboxes.acquire(ID, signal);
+  const { name, uid, resourceVersion } = pod(ID).metadata;
+  await created.touch();
+  const lease = kinds.leases!.get(name)!;
+  // Kubernetes deletes a lease with the pod that owns it.
+  expect(lease.metadata).toMatchObject({ ownerReferences: [{ kind: 'Pod', name, uid }] });
+  const first = lease.spec!.renewTime!;
+  expect(first).toMatch(/\.\d{6}Z$/);
+  await Bun.sleep(2);
+  await created.touch();
+  expect(Date.parse(lease.spec!.renewTime!)).toBeGreaterThan(Date.parse(first));
+  expect(pod(ID).metadata.resourceVersion).toBe(resourceVersion);
+
+  // Five minutes after the last report the sandbox sleeps like any other.
+  pod(ID).metadata.annotations['getenergy.com/acquired-ms'] = '0';
+  lease.spec = { renewTime: new Date(Date.now() - 4.5 * 60_000).toISOString() };
+  await sandboxes.sleepUnused();
+  expect(awake()).toEqual([ID]);
+  lease.spec = { renewTime: new Date(Date.now() - 5.5 * 60_000).toISOString() };
+  await sandboxes.sleepUnused();
+  expect(awake()).toEqual([]);
+});
+
+test('a report of use that arrives as the sweep claims the sandbox keeps it awake', async () => {
+  const { backend, request, age, awake, pod } = cluster({ drainStatus: 0, restores: true });
+  const created = await backend().acquire(ID, signal);
+  age(ID);
+  let reported = false;
+  // The report lands after the sweep listed the leases and before it claimed the pod.
+  const sweeping = backend({
+    request: async (method, path, body) => {
+      if (method === 'PATCH' && Array.isArray(body) && !reported) {
+        reported = true;
+        await created.touch();
+      }
+      return request(method, path, body);
+    },
+  });
+  await sweeping.sleepUnused();
+  expect(reported).toBe(true);
+  expect(awake()).toEqual([ID]);
+  expect(pod(ID).metadata.annotations['getenergy.com/sleeping-ms']).toBe('0');
 });
 
 test('leaves a sandbox running while drain says it has work', async () => {

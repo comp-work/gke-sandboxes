@@ -15,6 +15,9 @@ const sandboxes = new GkeSandboxes(new KubernetesApi(clusterUrl, getGoogleAccess
   namespace: 'sandboxes',
   serviceAccount: 'sandbox',
   image: 'docker.io/library/debian:bookworm-slim',
+  onPodLost(labels, phase, reason, hasSnapshot, recoveryPoint) {
+    console.warn('sandbox pod lost', { labels, phase, reason, hasSnapshot, ...recoveryPoint });
+  },
 });
 
 const { sandbox } = await sandboxes.acquire('session-42', AbortSignal.timeout(300_000));
@@ -31,6 +34,7 @@ await sandboxes.checkpoint(sandbox.id);
 - **Skip the cluster for commands.** By default each command and file transfer is an exec call through the Kubernetes API. Pass `directCommands: { port: 7391 }` and every sandbox started from then on runs a small command server on that port, which the client connects to directly. In one cluster a command took 30 ms this way against 220 ms through the API, and a 50 MiB upload 0.7 s against 2.3 s; direct commands also do not queue behind other API calls when many sandboxes are busy. See [what it needs](#run-commands-without-the-kubernetes-api) before turning it on.
 - **Move files.** `sandbox.fs.uploadFile(local, remote)` and `sandbox.fs.downloadFile(remote, local)` copy a file in either direction, binary-safe.
 - **Survive a runaway program.** A sandbox that reaches its memory limit is killed whole, and loses what it wrote since its last snapshot. Each sandbox therefore watches its own memory and ends its largest processes first. The ended command sees the reason on its error output. Pass `memoryWatchdog: { protect: ['my-service'] }` to name processes it must never end, or `memoryWatchdog: false` to turn it off. Each time it acts it prints a JSON line with `"event":"sandbox_memory_pressure"` to the container’s log, which GKE sends to Cloud Logging with the pod’s name and labels.
+- **Report pod loss.** When `acquire` finds a failed pod, `onPodLost` reports the selected Ready snapshot’s creation time (`recoveryPointAt`) and age in milliseconds at detection (`recoveryPointAgeMs`). Both fields are omitted without a usable timestamp. The SDK cannot tell which writes were lost. For restore outcome and duration, use the `wake` event from `onOperation`.
 - **Look across sandboxes.** `list(labels)` returns every sandbox with those labels, awake or asleep. `inventory()` adds where each one’s snapshots are stored, for metering. `deleteMatching(labels)` deletes every sandbox with those labels. Labels you pass to `acquire` as a third argument are set when a sandbox is created.
 - **Reach a port.** `endpoint(sandbox, port)` returns the sandbox’s private address. The quickstart blocks incoming traffic to sandboxes, so allow your caller in a network policy first, as the preview example does.
 - **Size the sandbox.** Pass `resources: { requests, limits }` to set what a sandbox reserves on its node and the most it may use. The requests decide how many sandboxes fit on a machine. Pass `disk` to set the size of the sandbox’s root filesystem, which must be below the `ephemeral-storage` limit.

@@ -104,7 +104,7 @@ bun examples/benchmark-warm-pool.ts --endpoint "$ENDPOINT" --controller "$CONTRO
 
 ## ComputeSDK benchmark
 
-On the [ComputeSDK sandbox benchmark](https://www.computesdk.com/benchmarks/sandboxes/ratings), the library as it stood on November 23, 2026 averaged about 30 over 16 suites. With a warm pool, commands sent straight to the sandbox, a snapshot adapter and C4D machines it averaged about 82, against 83.9 for the top provider that day. Most of the gain came without new spend: on E2 machines the same changes reached about 74. [Results, method and the cost of each change](benchmarks/computesdk-2026-11.md)
+On the [ComputeSDK sandbox benchmark](https://www.computesdk.com/benchmarks/sandboxes/ratings), gke-sandboxes averaged about 82 over 16 suites on C4D machines and about 74 on E2. On the public table on November 24, 2026, the top provider had 83.8, E2B 73.7 and Daytona 69.1. [Results per suite, method and costs](benchmarks/computesdk-2026-11.md)
 
 ## When to choose a managed provider
 

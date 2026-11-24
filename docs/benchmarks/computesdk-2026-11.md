@@ -4,43 +4,46 @@ What gke-sandboxes scored on the [ComputeSDK sandbox benchmark](https://www.comp
 
 ## Summary
 
-As the library stood on November 23, 2026, it would have averaged **about 30** over the 16 suites we ran. With every change described below it averaged **about 82**, against 83.9 for the top provider on the public table that day and 69.2 for Daytona. On E2 machines, without the move to C4D, the same changes reached **about 74**.
+gke-sandboxes averaged **about 82** over the 16 suites we ran on C4D machines and **about 74** on E2 machines. On the public table on November 24, 2026, the top provider (Superserve) had 83.8, E2B 73.7, Daytona 69.1 and Boat 19.3.
 
-Most of the gain came from four things: keeping running sandboxes ready, keeping the Kubernetes API out of the path of a start or a command, letting the benchmark reach features the library already had, and faster machines.
+The scores come from four things: keeping running sandboxes ready, keeping the Kubernetes API out of the path of a start or a command, an adapter onto the Pod snapshots the library already takes, and the machine type.
 
 ## How we ran it
 
 - **Benchmark:** the ComputeSDK repository at the time, run locally with `--no-ingest`, through a provider adapter written for gke-sandboxes. The adapter is not in this repository; it was a throwaway built for the run.
 - **Cluster:** GKE 1.36 in us-central1, gVisor, a production sandbox image (Debian 12) and the library's default reservation of 0.25 vCPU and 1 GiB. The driver ran in a pod in the same cluster.
-- **Machines:** `e2-highmem-16` nodes, as in the quickstart, and one `c4d-standard-16` node for the C4D runs.
-- **Scores:** each suite's own composite formula. The runner printed no composite for CPU and Rootfs, so those two are our calculation from the raw throughput and the suite's published ceilings. Public scores are the seven-day figures on the ratings page on November 23–24.
+- **Machines:** `e2-highmem-16` nodes, as in the quickstart, and one `c4d-standard-16` node. Four suites (Burst survival, OS capabilities, CI capabilities, OCI boot) were measured on C4D only.
+- **Scores:** each suite's own composite formula. The runner printed no composite for CPU and Rootfs, so those two are our calculation from the raw throughput and the suite's published ceilings. Public scores are the seven-day figures on the ratings page on November 24.
 - **Not run:** Soak (six hours) and Volumes (the library has no persistent volumes).
 - **Every run was on an otherwise empty node.** Nothing competed for CPU or disk. On a node packed with sandboxes the build, CPU and disk suites would score lower; we did not measure by how much.
 
 ## Results
 
-| Suite                 | Before         | Improved, E2 | Improved, C4D | Daytona | E2B | Best public |
-| --------------------- | -------------- | ------------ | ------------- | ------- | --- | ----------- |
-| Burst TTI             | 0              | 96           | 96            | 93      | 88  | 99          |
-| DAX (build)           | 0              | 43           | 73            | 60      | 53  | 80          |
-| Burst survival        | 96             | not rerun    | 97            | 100     | 98  | 100         |
-| OS capabilities       | 71             | not rerun    | 87            | 67      | 76  | 99          |
-| CI capabilities       | 59             | not rerun    | 94            | 65      | 94  | 100         |
-| CPU burst             | 60             | 67           | 66            | 60      | 69  | 76          |
-| CPU                   | about 8        | about 45     | about 78      | 31      | 11  | 52          |
-| Rootfs                | about 68       | about 68     | about 95      | 63      | 58  | 85          |
-| FS I/O (default mode) | 70             | 72           | 86            | 69      | 67  | 81          |
-| FS API                | did not finish | 83           | 93            | 74      | 60  | 87          |
-| Snap & restore        | no adapter     | 77           | 81            | 61      | 85  | 98          |
-| Snapshot              | no adapter     | 71           | 75            | 42      | 85  | 98          |
-| Fidelity              | 0              | 65           | 70            | 52      | 80  | 97          |
-| Snap fan-out          | no adapter     | 71           | 74            | 73      | 86  | 98          |
-| Pause / resume        | 0              | 75           | 75            | 0       | 91  | 99          |
-| OCI boot              | not run        | not rerun    | 75–78         | 70      | 88  | 98          |
+| Suite                 | E2           | C4D          | Superserve | E2B      | Daytona  | Boat     | Best public |
+| --------------------- | ------------ | ------------ | ---------- | -------- | -------- | -------- | ----------- |
+| Burst TTI             | 96           | 96           | 94         | 87       | 93       | 0        | 99          |
+| DAX (build)           | 43           | 73           | 71         | 48       | 60       | 9        | 80          |
+| Burst survival        | –            | 97           | 100        | 98       | 100      | 64       | 100         |
+| OS capabilities       | –            | 87           | 99         | 76       | 67       | 47       | 99          |
+| CI capabilities       | –            | 94           | 100        | 94       | 65       | 50       | 100         |
+| CPU burst             | 67           | 66           | 68         | 69       | 59       | 49       | 76          |
+| CPU                   | about 45     | about 78     | 22         | 10       | 33       | 9        | 52          |
+| Rootfs                | about 68     | about 95     | 70         | 57       | 63       | 57       | 85          |
+| FS I/O (default mode) | 72           | 86           | 73         | 67       | 69       | 52       | 81          |
+| FS API                | 83           | 93           | 83         | 60       | 74       | 38       | 86          |
+| Snap & restore        | 77           | 81           | 94         | 86       | 68       | 31       | 98          |
+| Snapshot              | 71           | 75           | 94         | 86       | 41       | 0        | 99          |
+| Fidelity              | 65           | 70           | 91         | 80       | 43       | 9        | 97          |
+| Snap fan-out          | 71           | 74           | 95         | 87       | 75       | 12       | 98          |
+| Pause / resume        | 75           | 75           | 97         | 92       | 0        | 0        | 99          |
+| OCI boot              | –            | 75–78        | 98         | 87       | 67       | 0        | 98          |
+| Soak                  | not run      | not run      | 100        | 100      | 100      | 67       | 100         |
+| Volumes               | not run      | not run      | 0          | 0        | 49       | 0        | 84          |
+| **Average**           | **about 74** | **about 82** | **83.8**   | **73.7** | **69.1** | **19.3** |             |
 
-The E2 average borrows the C4D score for the four suites not rerun on E2. A suite that runs and fails counts as 0 in the public average, while one a provider has no score for is left out, so the snapshot suites mattered more than polishing suites already in the 60s.
+A dash is a suite measured on C4D only; the E2 average uses the C4D score for those four. The public average counts a suite a provider fails as 0 and leaves out one it has no score for.
 
-## What moved each score
+## What each score depends on
 
 ### Starting sandboxes in a burst
 
@@ -72,16 +75,16 @@ The fastest row keeps the pool's bookkeeping in the caller's own database, so a 
 
 C4D roughly doubles build, CPU and disk throughput. Start-up, snapshots and capabilities barely change with the machine.
 
-The build suite needs root, and at 2 vCPU / 4 GiB its typecheck runs out of memory, so it scored 0 at the default size. It ran with root and an 8 vCPU / 16 GiB limit. The reservation stayed at 0.25 vCPU and 1 GiB.
+The build suite needs root, and at 2 vCPU / 4 GiB its typecheck runs out of memory. It ran with root and an 8 vCPU / 16 GiB limit. The reservation stayed at 0.25 vCPU and 1 GiB.
 
-The CPU suite hashes with `sha256sum`, and Debian 12's does not use the CPU's SHA instructions: 2 GB took 9.5 s against 3.9 s with `openssl`. An OpenSSL-backed `sha256sum`, and a limit of twice the sized CPU, lift that suite from about 8 to about 45 on E2. That helps the benchmark more than users.
+The CPU suite hashes with `sha256sum`, and Debian 12's does not use the CPU's SHA instructions: 2 GB took 9.5 s against 3.9 s with `openssl`. The CPU scores above use an OpenSSL-backed `sha256sum` and a limit of twice the sized CPU; with the image's own `sha256sum` the suite scores about 8. That helps the benchmark more than users.
 
-### Features the benchmark could not reach
+### Snapshots, capabilities and files
 
-- **Snapshots.** Five suites scored 0 for want of an adapter onto Pod snapshots. With one, files-only snapshots score 65–77 on E2. Memory-preserving snapshots, which keep running processes and need non-E2 machines, add 3–5 points. A snapshot took about 2.7–2.9 s and a restore about 2 s, which is what holds these suites in the 70s.
+- **Snapshots.** The five snapshot suites ran through an adapter onto Pod snapshots. Files-only snapshots score 65–77 on E2. Memory-preserving snapshots, which keep running processes and need non-E2 machines, add 3–5 points. A snapshot took about 2.7–2.9 s and a restore about 2 s, which is what holds these suites in the 70s.
 - **Pause / resume** is a snapshot followed by deleting the pod, and a resume starts a pod from it under the same id: about 3.2 s and 2.2 s.
-- **Capabilities.** Root and extra capabilities inside gVisor take OS capabilities from 71 to 87. A Docker-ready image (legacy iptables, and Docker told to leave the firewall alone) takes CI capabilities to 94. Containers still cannot reach each other by name under gVisor. The quickstart enforces the `baseline` Pod Security level, which forbids those capabilities.
-- **File transfer.** Writes of 64 MB and up timed out through exec, so FS API did not finish. Sent straight to the sandbox it scores 83–93.
+- **Capabilities.** OS and CI capabilities ran with root and extra capabilities inside gVisor (71 and 59 without), and CI capabilities with a Docker-ready image (legacy iptables, and Docker told to leave the firewall alone). Containers still cannot reach each other by name under gVisor. The quickstart enforces the `baseline` Pod Security level, which forbids those capabilities.
+- **File transfer.** FS API ran with files sent straight to the sandbox. Through exec, writes of 64 MB and up timed out and the suite did not finish.
 
 ### Remaining weak spots
 

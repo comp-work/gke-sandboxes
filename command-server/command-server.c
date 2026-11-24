@@ -2,14 +2,16 @@
 // network and runs one command per connection, instead of asking the Kubernetes API to exec.
 //
 // Both directions carry frames: one byte of type, four bytes of payload length (big-endian), then
-// the payload. The client sends AUTH (the pod's token), ARGV (the arguments, each ended by a zero
-// byte), any number of STDIN frames and one CLOSE. The server answers the token with ACCEPTED,
-// before anything runs, so a client that reached the wrong pod knows nothing ran. It then sends
-// STDOUT and STDERR frames as the command prints, and one EXIT whose payload is the exit code in
-// decimal.
+// the payload. The pod's token has two halves. The client sends the first in AUTH, and the server
+// answers with the second in ACCEPTED, before anything runs: each side has then shown the other
+// that it knows the token, and a client that reached the wrong pod knows that nothing ran. Only
+// then does the client send ARGV (the arguments, each ended by a zero byte), any number of STDIN
+// frames and one CLOSE. The server sends STDOUT and STDERR frames as the command prints, and one
+// EXIT whose payload is the exit code in decimal.
 //
-// A client that goes away does not stop its command, as with a Kubernetes exec: the command loses
-// its output and is ended by whoever started it with a time limit.
+// A client that goes away after CLOSE does not stop its command, as with a Kubernetes exec: the
+// command loses its output and is ended by whoever started it with a time limit. A client that
+// goes away before CLOSE has not finished saying what to run or write, so its command is ended.
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -22,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -33,10 +36,22 @@ enum { AUTH_FRAME = 16, ARGV_FRAME = 17, CLOSE_FRAME = 255 };
 
 // A client sends its stdin in pieces of 256 KiB.
 #define MAX_PAYLOAD (1024 * 1024)
+#define MAX_AUTH 256
 #define MAX_ARGUMENTS 256
 #define OUTPUT_CHUNK (64 * 1024)
-// How long a connection may take to say who it is and what to run.
+// How long a connection may take, in all, to say who it is and what to run.
 #define HANDSHAKE_MS 10000
+// How long a frame that has begun may take to arrive.
+#define FRAME_MS 30000
+// Connections served at once. Each is a process, and a caller that is not let in must not be able
+// to fill the sandbox with them.
+#define MAX_HANDLERS 256
+
+static long long now_ms(void) {
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  return (long long)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
 
 static int write_all(int fd, const unsigned char *data, size_t length) {
   while (length > 0) {
@@ -56,10 +71,13 @@ static int write_all(int fd, const unsigned char *data, size_t length) {
   return 0;
 }
 
-static int read_all(int fd, unsigned char *data, size_t length, int timeout_ms) {
+// `deadline` is a time on now_ms's clock.
+static int read_all(int fd, unsigned char *data, size_t length, long long deadline) {
   while (length > 0) {
+    long long left = deadline - now_ms();
+    if (left <= 0) return -1;
     struct pollfd ready = {.fd = fd, .events = POLLIN};
-    int polled = poll(&ready, 1, timeout_ms);
+    int polled = poll(&ready, 1, (int)left);
     if (polled < 0 && errno == EINTR) continue;
     if (polled <= 0) return -1;
     ssize_t count = read(fd, data, length);
@@ -78,20 +96,21 @@ static int send_frame(int fd, unsigned char type, const unsigned char *payload, 
   return write_all(fd, payload, length);
 }
 
-// Reads one frame into `payload`, which holds MAX_PAYLOAD + 1 bytes. Returns its type, or -1.
-static int read_frame(int fd, unsigned char *payload, uint32_t *length, int timeout_ms) {
+// Reads one frame of at most `limit` bytes into `payload`. Returns its type, or -1.
+static int read_frame(int fd, unsigned char *payload, uint32_t *length, uint32_t limit,
+                      long long deadline) {
   unsigned char header[5];
-  if (read_all(fd, header, sizeof header, timeout_ms) < 0) return -1;
+  if (read_all(fd, header, sizeof header, deadline) < 0) return -1;
   *length = ((uint32_t)header[1] << 24) | ((uint32_t)header[2] << 16) | ((uint32_t)header[3] << 8) |
             (uint32_t)header[4];
-  if (*length > MAX_PAYLOAD) return -1;
-  if (read_all(fd, payload, *length, timeout_ms) < 0) return -1;
+  if (*length > limit) return -1;
+  if (read_all(fd, payload, *length, deadline) < 0) return -1;
   return header[0];
 }
 
 // Takes the same time whatever the tokens share, so the time tells a guesser nothing.
-static int same_token(const unsigned char *given, size_t given_length, const char *token) {
-  size_t length = strlen(token);
+static int same_token(const unsigned char *given, size_t given_length, const char *token,
+                      size_t length) {
   unsigned char difference = (unsigned char)(given_length != length);
   for (size_t index = 0; index < length; index++)
     difference |= (unsigned char)((index < given_length ? given[index] : 0) ^ (unsigned char)token[index]);
@@ -103,10 +122,14 @@ static void serve(int client, const char *token) {
   static unsigned char output[OUTPUT_CHUNK];
   uint32_t length;
 
-  if (read_frame(client, payload, &length, HANDSHAKE_MS) != AUTH_FRAME) return;
-  if (!same_token(payload, length, token)) return;
-  if (send_frame(client, ACCEPTED_FRAME, payload, 0) < 0) return;
-  if (read_frame(client, payload, &length, HANDSHAKE_MS) != ARGV_FRAME) return;
+  long long handshake = now_ms() + HANDSHAKE_MS;
+  size_t half = strlen(token) / 2;
+  if (read_frame(client, payload, &length, MAX_AUTH, handshake) != AUTH_FRAME) return;
+  if (!same_token(payload, length, token, half)) return;
+  if (send_frame(client, ACCEPTED_FRAME, (const unsigned char *)token + half,
+                 (uint32_t)(strlen(token) - half)) < 0)
+    return;
+  if (read_frame(client, payload, &length, MAX_PAYLOAD, handshake) != ARGV_FRAME) return;
   if (length == 0 || payload[length - 1] != 0) return;
   char *arguments[MAX_ARGUMENTS + 1];
   int count = 0;
@@ -120,8 +143,10 @@ static void serve(int client, const char *token) {
   if (pipe(in) < 0 || pipe(out) < 0 || pipe(err) < 0) return;
   pid_t child = fork();
   if (child < 0) return;
+  // A group of its own, as a command started by the container runtime has. Set from both sides,
+  // so that it holds whichever runs first.
+  setpgid(child, child);
   if (child == 0) {
-    // A group of its own, as a command started by the container runtime has.
     setpgid(0, 0);
     dup2(in[0], 0);
     dup2(out[1], 1);
@@ -156,9 +181,13 @@ static void serve(int client, const char *token) {
       _exit(0);
     }
     if (fds[0].revents) {
-      int type = read_frame(client, payload, &length, HANDSHAKE_MS);
-      // The client left. Its command runs on without it.
-      if (type < 0) _exit(0);
+      int type = read_frame(client, payload, &length, MAX_PAYLOAD, now_ms() + FRAME_MS);
+      // The client left before it had sent everything, so the command would run on half of its
+      // input: a script cut short, or a file written in part and reported whole.
+      if (type < 0) {
+        kill(-child, SIGKILL);
+        _exit(0);
+      }
       if (type == STDIN_FRAME) {
         pending = length;
         taken = 0;
@@ -195,13 +224,31 @@ static void serve(int client, const char *token) {
   int written = snprintf(code, sizeof code, "%d",
                          WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status));
   send_frame(client, EXIT_FRAME, (unsigned char *)code, (uint32_t)written);
+  // Closing with input still unread would reset the connection, and the exit code with it. So the
+  // client is told that nothing more comes, and what it still sends is read and dropped.
+  shutdown(client, SHUT_WR);
+  long long closing = now_ms() + 2000;
+  while (now_ms() < closing) {
+    struct pollfd ready = {.fd = client, .events = POLLIN};
+    if (poll(&ready, 1, (int)(closing - now_ms())) <= 0) break;
+    if (read(client, payload, MAX_PAYLOAD) <= 0) break;
+  }
+}
+
+// Handlers that have not ended yet.
+static volatile sig_atomic_t handlers = 0;
+static void reap(int signal_number) {
+  (void)signal_number;
+  int saved = errno;
+  while (waitpid(-1, NULL, WNOHANG) > 0) handlers--;
+  errno = saved;
 }
 
 int main(void) {
   const char *configured = getenv(TOKEN_VARIABLE);
   const char *port = getenv(PORT_VARIABLE);
-  if (!configured || strlen(configured) < 32 || !port) {
-    dprintf(2, "%s (32 characters or more) and %s are required.\n", TOKEN_VARIABLE, PORT_VARIABLE);
+  if (!configured || strlen(configured) < 64 || strlen(configured) > 2 * MAX_AUTH || !port) {
+    dprintf(2, "%s (64 characters or more) and %s are required.\n", TOKEN_VARIABLE, PORT_VARIABLE);
     return 2;
   }
   char *token = strdup(configured);
@@ -220,8 +267,9 @@ int main(void) {
     dprintf(2, "Could not listen on port %s: %s\n", port, strerror(errno));
     return 1;
   }
-  // The kernel reaps the connection handlers.
-  signal(SIGCHLD, SIG_IGN);
+  struct sigaction reaping = {.sa_handler = reap};
+  sigemptyset(&reaping.sa_mask);
+  sigaction(SIGCHLD, &reaping, NULL);
   signal(SIGPIPE, SIG_IGN);
   while (1) {
     int client = accept(listener, NULL, NULL);
@@ -231,7 +279,18 @@ int main(void) {
       usleep(50000);
       continue;
     }
+    if (handlers >= MAX_HANDLERS) {
+      close(client);
+      continue;
+    }
+    // Counted before it can end, so the count never misses one.
+    sigset_t child_signal, previous;
+    sigemptyset(&child_signal);
+    sigaddset(&child_signal, SIGCHLD);
+    sigprocmask(SIG_BLOCK, &child_signal, &previous);
     pid_t handler = fork();
+    if (handler > 0) handlers++;
+    sigprocmask(SIG_SETMASK, &previous, NULL);
     if (handler == 0) {
       close(listener);
       // The handler waits for its own command.

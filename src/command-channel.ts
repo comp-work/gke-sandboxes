@@ -1,3 +1,4 @@
+import { timingSafeEqual } from 'node:crypto';
 import { connect, type Socket } from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
 import { collectOutput, type ExecOptions, type KubernetesExecResult } from './kubernetes-api.js';
@@ -13,9 +14,14 @@ const ARGV = 17;
 const CLOSE = 255;
 const STDIN_CHUNK_BYTES = 256 * 1024;
 const MAX_ARGV_BYTES = 1024 * 1024;
+const MAX_ARGUMENTS = 256;
 // A pod reports ready a moment before its command server listens.
 const LISTEN_WAIT_MS = 5000;
 const CONNECT_TIMEOUT_MS = 5000;
+// An address remembered from an earlier command answers at once or belongs to no pod any more.
+const REMEMBERED_CONNECT_TIMEOUT_MS = 1000;
+// How long the server may take to show that it is the pod the token belongs to.
+const ACCEPT_TIMEOUT_MS = 5000;
 
 export type CommandServerAddress = { host: string; port: number; token: string };
 
@@ -47,7 +53,7 @@ const open = async (address: CommandServerAddress, waitForListener: boolean) => 
     const connected = Promise.withResolvers<NodeJS.ErrnoException | null>();
     const timer = setTimeout(
       () => connected.resolve(Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' })),
-      CONNECT_TIMEOUT_MS,
+      waitForListener ? CONNECT_TIMEOUT_MS : REMEMBERED_CONNECT_TIMEOUT_MS,
     );
     socket.once('connect', () => connected.resolve(null));
     socket.once('error', connected.resolve);
@@ -64,6 +70,10 @@ const open = async (address: CommandServerAddress, waitForListener: boolean) => 
  * Runs a command in a sandbox through its command server, feeding it `stdin` and collecting its
  * output, as `KubernetesApi.exec` does through the cluster. `waitForListener` allows a pod that
  * has just started the moment its server needs.
+ *
+ * The token has two halves. The server is sent the first and must answer with the second before
+ * it is told what to run, so whatever answers at a reused address learns nothing and can report
+ * nothing. `CommandServerUnreachableError` therefore always means that no command ran.
  */
 export const directExec = async (
   address: CommandServerAddress,
@@ -74,15 +84,28 @@ export const directExec = async (
   waitForListener: boolean,
 ): Promise<KubernetesExecResult> => {
   const argv = Buffer.from(command.map((argument) => `${argument}\0`).join(''));
-  if (command.some((argument) => argument.includes('\0')) || argv.byteLength > MAX_ARGV_BYTES)
-    throw new Error('A sandbox command cannot contain a zero byte or exceed 1 MiB.');
+  if (
+    command.length > MAX_ARGUMENTS ||
+    command.some((argument) => argument.includes('\0')) ||
+    argv.byteLength > MAX_ARGV_BYTES
+  )
+    throw new Error(
+      `A sandbox command takes at most ${MAX_ARGUMENTS} arguments and 1 MiB, without zero bytes.`,
+    );
+  const half = address.token.length >> 1;
+  const expected = Buffer.from(address.token.slice(half));
   const socket: Socket = await open(address, waitForListener);
   const finished = Promise.withResolvers<KubernetesExecResult>();
   const collected = collectOutput(options);
+  const unreachable = (reason: string) => {
+    finished.reject(new CommandServerUnreachableError(address, reason));
+    socket.destroy();
+  };
   const timer = setTimeout(() => {
     finished.reject(new Error(`Sandbox command timed out after ${timeoutSeconds} seconds.`));
     socket.destroy();
   }, timeoutSeconds * 1000);
+  const accepting = setTimeout(() => unreachable('it did not answer the token'), ACCEPT_TIMEOUT_MS);
   let accepted = false;
   // Frames arrive in pieces, and several at once.
   let received: Buffer = Buffer.alloc(0);
@@ -94,7 +117,22 @@ export const directExec = async (
       const type = received[0];
       const payload = received.subarray(5, 5 + length);
       received = received.subarray(5 + length);
-      if (type === ACCEPTED) accepted = true;
+      if (!accepted) {
+        if (
+          type !== ACCEPTED ||
+          payload.byteLength !== expected.byteLength ||
+          !timingSafeEqual(payload, expected)
+        )
+          return unreachable('what answered is not the pod the token belongs to');
+        accepted = true;
+        clearTimeout(accepting);
+        for (const piece of frame(ARGV, argv)) socket.write(piece);
+        for (let offset = 0; offset < stdin.byteLength; offset += STDIN_CHUNK_BYTES)
+          for (const piece of frame(STDIN, stdin.subarray(offset, offset + STDIN_CHUNK_BYTES)))
+            socket.write(piece);
+        for (const piece of frame(CLOSE, new Uint8Array())) socket.write(piece);
+        continue;
+      }
       if (type === STDOUT || type === STDERR)
         collected.add(payload, type === STDOUT ? 'stdout' : 'stderr');
       if (type !== EXIT) continue;
@@ -103,18 +141,14 @@ export const directExec = async (
     }
   });
   const ended = (reason: string) =>
-    finished.reject(
-      accepted
-        ? new Error(`Sandbox command ${reason}.`)
-        : new CommandServerUnreachableError(address, 'the token was not accepted'),
-    );
+    accepted
+      ? finished.reject(new Error(`Sandbox command ${reason}.`))
+      : unreachable('the token was not accepted');
   socket.on('error', () => ended('connection failed'));
   socket.on('close', () => ended('ended without a status'));
-  for (const piece of frame(AUTH, Buffer.from(address.token))) socket.write(piece);
-  for (const piece of frame(ARGV, argv)) socket.write(piece);
-  for (let offset = 0; offset < stdin.byteLength; offset += STDIN_CHUNK_BYTES)
-    for (const piece of frame(STDIN, stdin.subarray(offset, offset + STDIN_CHUNK_BYTES)))
-      socket.write(piece);
-  for (const piece of frame(CLOSE, new Uint8Array())) socket.write(piece);
-  return finished.promise.finally(() => clearTimeout(timer));
+  for (const piece of frame(AUTH, Buffer.from(address.token.slice(0, half)))) socket.write(piece);
+  return finished.promise.finally(() => {
+    clearTimeout(timer);
+    clearTimeout(accepting);
+  });
 };

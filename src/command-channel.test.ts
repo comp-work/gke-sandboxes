@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { connect, createServer } from 'node:net';
 import { CommandServerUnreachableError, directExec } from './command-channel.ts';
 import { COMMAND_SERVER } from './command-server-binary.ts';
 import { GkeSandboxes, KubernetesApi } from './index.ts';
@@ -139,6 +140,83 @@ test('refuses a caller without the token, and runs nothing for it', async () => 
   expect(attempt).rejects.toBeInstanceOf(CommandServerUnreachableError);
   await attempt.catch(() => undefined);
   expect(await Bun.file(marker).exists()).toBe(false);
+});
+
+const frame = (type: number, payload: string | Uint8Array) => {
+  const body = Buffer.from(payload);
+  const header = Buffer.alloc(5);
+  header[0] = type;
+  header.writeUInt32BE(body.byteLength, 1);
+  return Buffer.concat([header, body]);
+};
+
+test('what answers at a reused address is told nothing and can report nothing', async () => {
+  // Another sandbox now has the address. It accepts anything and reports success.
+  const heard: Buffer[] = [];
+  const impostor = createServer((socket) => {
+    socket.on('data', (chunk: Buffer) => heard.push(chunk));
+    socket.write(Buffer.concat([frame(4, 'f'.repeat(32)), frame(1, 'FAKE\n'), frame(3, '0')]));
+  }).listen(0, '127.0.0.1');
+  await new Promise((resolve) => impostor.once('listening', resolve));
+  const { port: taken } = impostor.address() as { port: number };
+  const attempt = directExec(
+    { ...address(), port: taken },
+    sh('export SECRET=hunter2'),
+    new TextEncoder().encode('private input'),
+    30,
+    {},
+    false,
+  );
+  expect(attempt).rejects.toBeInstanceOf(CommandServerUnreachableError);
+  await attempt.catch(() => undefined);
+  await Bun.sleep(50);
+  impostor.close();
+  // Only the first half of the token, which is of no use without the pod it belonged to.
+  expect(Buffer.concat(heard).equals(frame(16, TOKEN.slice(0, 32)))).toBe(true);
+});
+
+test('a caller that leaves before it has sent everything gets nothing run on half of it', async () => {
+  const written = join(directory, 'partial');
+  const marker = join(directory, 'partial-done');
+  const socket = connect({ host: '127.0.0.1', port });
+  await new Promise((resolve) => socket.once('connect', resolve));
+  socket.write(frame(16, TOKEN.slice(0, 32)));
+  await new Promise((resolve) => socket.once('data', resolve));
+  socket.write(frame(17, `sh\0-c\0cat > ${written}; touch ${marker}\0`));
+  socket.write(frame(0, 'the first half'));
+  await Bun.sleep(200);
+  socket.destroy();
+  await Bun.sleep(300);
+  expect(await Bun.file(marker).exists()).toBe(false);
+});
+
+test('a caller that is not let in cannot make the server read a large frame', async () => {
+  const socket = connect({ host: '127.0.0.1', port });
+  await new Promise((resolve) => socket.once('connect', resolve));
+  const header = Buffer.alloc(5);
+  header[0] = 16;
+  header.writeUInt32BE(1024 * 1024, 1);
+  socket.write(header);
+  // Closed at once, before any of the frame is sent.
+  expect(
+    await Promise.race([
+      new Promise((resolve) => socket.once('close', () => resolve('closed'))),
+      Bun.sleep(1000),
+    ]),
+  ).toBe('closed');
+});
+
+test('refuses more arguments than the server takes', async () => {
+  expect(
+    directExec(
+      address(),
+      Array.from({ length: 300 }, () => 'x'),
+      new Uint8Array(),
+      30,
+      {},
+      true,
+    ),
+  ).rejects.toThrow('at most 256 arguments');
 });
 
 test('an address nothing listens on is unreachable', async () => {

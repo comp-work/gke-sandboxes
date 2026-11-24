@@ -161,8 +161,9 @@ const podCommand = (
   'sh',
   '-c',
   `${first ? `printf %s "$0" > ${SANDBOX_ID_FILE} || exit 1\n` : ''}${
-    // Restarted if it ever ends: without it the sandbox takes no commands. Nothing else in the
-    // sandbox is handed the token.
+    // Restarted if it ever ends: without it the sandbox takes no commands. The programs the
+    // sandbox starts do not inherit the token, though anything in the sandbox can still find it:
+    // it lets a caller into this sandbox only.
     commandServer
       ? `(while :; do "${COMMAND_SERVER_MOUNT}/command-server-$(uname -m)"; sleep 1; done) </dev/null &\nunset GKE_SANDBOXES_COMMAND_TOKEN GKE_SANDBOXES_COMMAND_PORT\n`
       : ''
@@ -1252,10 +1253,10 @@ export class GkeSandboxes {
       setImmediate(() => {
         firstPod = null;
       }).unref();
-    // The command server this handle last reached. Its token is the pod's own, so a connection it
-    // accepts is to that pod, and the pod need not be looked up again for every command. A pod
-    // that is gone, or whose address another pod has taken, accepts nothing: the sandbox's pod is
-    // then looked up as for a first command.
+    // The command server this handle last reached. The pod need not be looked up again for every
+    // command: the server must show that it holds the pod's token before it is told what to run,
+    // so a pod that is gone, or whose address another pod has taken, is sent nothing and runs
+    // nothing. The sandbox's pod is then looked up as for a first command.
     let reached: CommandServerAddress | null = null;
     const run = async (
       command: string[],

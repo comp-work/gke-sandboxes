@@ -193,19 +193,20 @@ test('exec returns output and the exit code when GKE sends status and leaves the
   }
 });
 
-test('lists come from the API server cache once it has caught up with a shared read', async () => {
-  const seen: string[] = [];
+test('lists come from the API server cache once it has caught up with a read made during the call', async () => {
   let versionReads = 0;
   let behind = false;
   const server = Bun.serve({
     port: 0,
     async fetch(request) {
       const { searchParams } = new URL(request.url);
-      seen.push(searchParams.toString());
       if (searchParams.get('limit') === '1') {
         versionReads++;
         await Bun.sleep(20);
-        return Response.json({ metadata: { resourceVersion: '42' }, items: [] });
+        return Response.json({
+          metadata: { resourceVersion: String(40 + versionReads) },
+          items: [],
+        });
       }
       // The cache can fall behind the version asked for, and the server then says so.
       if (behind && searchParams.has('resourceVersion'))
@@ -216,20 +217,27 @@ test('lists come from the API server cache once it has caught up with a shared r
   try {
     const api = new KubernetesApi(server.url.href, async () => 'test');
     const pods = '/api/v1/namespaces/sandboxes/pods';
+    const query = (list: unknown) => (list as { items: [{ query: string }] }).items[0].query;
+    // The first caller starts a read of the current version. Those that arrive while it is under
+    // way could have written something it does not see, so they share the next read.
     const lists = await Promise.all(
       ['a', 'b', 'c'].map((name) => api.list(pods, `?labelSelector=sandbox%3D${name}`)),
     );
-    // Callers that arrive together share one read of the current version.
-    expect(versionReads).toBe(1);
-    for (const list of lists)
-      expect((list as { items: [{ query: string }] }).items[0].query).toEndWith(
-        'resourceVersion=42&resourceVersionMatch=NotOlderThan',
-      );
+    expect(versionReads).toBe(2);
+    expect(lists.map(query)).toEqual([
+      'labelSelector=sandbox%3Da&resourceVersion=41&resourceVersionMatch=NotOlderThan',
+      'labelSelector=sandbox%3Db&resourceVersion=42&resourceVersionMatch=NotOlderThan',
+      'labelSelector=sandbox%3Dc&resourceVersion=42&resourceVersionMatch=NotOlderThan',
+    ]);
+    // A cache that falls behind is read around for a while, without the wait each time.
     behind = true;
-    const fallback = (await api.list(pods, '?labelSelector=sandbox%3Dd')) as {
-      items: [{ query: string }];
-    };
-    expect([versionReads, fallback.items[0].query]).toEqual([2, 'labelSelector=sandbox%3Dd']);
+    expect(query(await api.list(pods, '?labelSelector=sandbox%3Dd'))).toBe(
+      'labelSelector=sandbox%3Dd',
+    );
+    expect(query(await api.list(pods, '?labelSelector=sandbox%3De'))).toBe(
+      'labelSelector=sandbox%3De',
+    );
+    expect(versionReads).toBe(3);
   } finally {
     await server.stop(true);
   }

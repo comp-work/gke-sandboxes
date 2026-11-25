@@ -403,8 +403,10 @@ export class GkeSandboxes {
   private readonly diskBytes: number;
   private readonly configMaps: string;
   private commandServer: Promise<void> | undefined;
-  // Pool pods this process is labelling as the sandboxes they were handed out as.
+  // Pool pods this process is labelling as the sandboxes they were handed out as, and those it
+  // handed out and will label shortly.
   private readonly adopting = new Map<string, Promise<void>>();
+  private readonly unlabelled = new Map<string, Labels>();
 
   constructor(
     private readonly kubernetes: KubernetesApi,
@@ -637,9 +639,14 @@ export class GkeSandboxes {
             ({ metadata }) => metadata.labels[POOL_LABEL] === name && !present.has(metadata.name),
           )
           .map(({ metadata }) =>
-            this.kubernetes.request('DELETE', `${this.leases}/${metadata.name}`, {
-              preconditions: { resourceVersion: metadata.resourceVersion },
-            }),
+            this.kubernetes
+              .request('DELETE', `${this.leases}/${metadata.name}`, {
+                preconditions: { resourceVersion: metadata.resourceVersion },
+              })
+              .catch((error) => {
+                // Changed or removed since the list was read; the next pass decides again.
+                if (!(error instanceof KubernetesApiError && error.status === 409)) throw error;
+              }),
           ),
         ...free
           .filter((pod) => !keep.has(pod.metadata.uid))
@@ -724,6 +731,12 @@ export class GkeSandboxes {
         // it started before either was known.
         const boot = this.options.boot?.(sandboxLabels);
         const prepare = sandboxId !== podName || !!boot;
+        // A pod deleted since the list was read, by a node drain or `delete`, holds no Lease that
+        // kept this caller off it. Without a command to fail on it, it is read once more.
+        if (!prepare) {
+          const current = await this.kubernetes.request('GET', `${this.pods}/${podName}`);
+          if (!current || terminating(PodSchema.parse(current))) continue;
+        }
         try {
           if (prepare) {
             const { exitCode, output } = await this.runIn(
@@ -759,8 +772,9 @@ export class GkeSandboxes {
         // webhook and would compete with them. Until then lookups read the labels from the record;
         // a snapshot labels the pod first, and the pool's maintainer labels one this process did
         // not get to.
+        this.unlabelled.set(podName, sandboxLabels);
         setTimeout(
-          () => this.adopt(podName, sandboxLabels).catch(() => undefined),
+          () => this.adoptPending(podName)?.catch(() => undefined),
           ADOPT_DELAY_MS + randomInt(ADOPT_DELAY_MS),
         ).unref();
         this.report('create', sandboxLabels, pod, startedAt, null);
@@ -831,8 +845,8 @@ export class GkeSandboxes {
   }
 
   async labelPod(podName: string, labels: Labels) {
-    // A pool pod is labelled as its sandbox first, which adds only the labels it lacks.
-    await this.adopting.get(podName)?.catch(() => undefined);
+    // A pool pod is labelled as its sandbox first, so that it is found by these labels too.
+    await (this.adoptPending(podName) ?? this.adopting.get(podName))?.catch(() => undefined);
     if (
       !(await this.kubernetes.request('PATCH', `${this.pods}/${podName}`, { metadata: { labels } }))
     )
@@ -962,9 +976,10 @@ export class GkeSandboxes {
    */
   async inventory() {
     const query = `?labelSelector=${this.selector({})},${SANDBOX_LABEL}`;
-    const [pods, snapshots] = await Promise.all([
+    const [pods, snapshots, records] = await Promise.all([
       this.kubernetes.request('GET', `${this.pods}${query}`),
       this.kubernetes.request('GET', `${this.snapshotsPath}${query}`),
+      this.kubernetes.request('GET', `${this.leases}${query}`),
     ]);
     const sandboxes = new Map<
       string,
@@ -986,7 +1001,18 @@ export class GkeSandboxes {
       sandboxes.set(sandboxId, found);
       return found;
     };
-    for (const pod of listOf(PodSchema).parse(pods).items) {
+    const labelled = listOf(PodSchema).parse(pods).items;
+    // A pool pod handed out moments ago may not carry its sandbox's labels yet; its record does.
+    const handedOut = await Promise.all(
+      listOf(LeaseSchema)
+        .parse(records)
+        .items.filter(({ metadata }) => metadata.name.endsWith(IDENTITY_SUFFIX))
+        .map((record) => this.claimedPod(record)),
+    );
+    for (const pod of [
+      ...labelled,
+      ...handedOut.filter((pod): pod is Pod => !!pod && POOL_LABEL in pod.metadata.labels),
+    ]) {
       const found = sandbox(pod.metadata);
       // A pod that is going to sleep no longer accepts work.
       if (pod.status.phase === 'Running' && !sleeping(pod)) found.state = 'running';
@@ -1172,6 +1198,14 @@ export class GkeSandboxes {
           if (!(error instanceof KubernetesApiError && error.status === 409)) throw error;
         });
     }
+  }
+
+  /** Labels a pool pod this process handed out now, if it has not yet. */
+  private adoptPending(podName: string) {
+    const labels = this.unlabelled.get(podName);
+    if (!labels) return undefined;
+    this.unlabelled.delete(podName);
+    return this.adopt(podName, labels);
   }
 
   /**

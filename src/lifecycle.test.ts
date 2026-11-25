@@ -1278,3 +1278,49 @@ test("a maintainer's Lease on a spare it removed stays until the pod is gone, th
   expect(kinds.leases!.has(spare!.metadata.name)).toBe(false);
   expect(kinds.leases!.has(podName)).toBe(true);
 });
+
+test('a sandbox labelled or counted right after its hand-out is found by those labels', async () => {
+  const { backend, kinds } = cluster({ drainStatus: 0, restores: true });
+  const sandboxes = backend();
+  const pool = sandboxes.warmPool('agents');
+  await pool.reconcile(1);
+  const { podName } = await pool.acquire(ID, signal, { team: 'blue' });
+  expect((await sandboxes.inventory()).map(({ sandboxId, state }) => [sandboxId, state])).toEqual([
+    [ID, 'running'],
+  ]);
+  await sandboxes.labelPod(podName, { state: 'ready' });
+  expect(kinds.pods!.get(podName)!.metadata.labels).toMatchObject({
+    'energy-sandbox': ID,
+    team: 'blue',
+    state: 'ready',
+  });
+  expect((await sandboxes.list({ state: 'ready' })).map(({ name }) => name)).toEqual([ID]);
+});
+
+test('a spare deleted after the pool was listed is not handed out', async () => {
+  const { backend, request, kinds, linger } = cluster({ drainStatus: 0, restores: true });
+  const sandboxes = backend({
+    request: async (method, path, body) => {
+      // A node drain deletes the spare just as a caller takes it.
+      if (
+        method === 'POST' &&
+        path.endsWith('/leases') &&
+        !(body as any).metadata.name.includes('.')
+      ) {
+        linger();
+        await request(
+          'DELETE',
+          path
+            .replace('/apis/coordination.k8s.io/v1', '/api/v1')
+            .replace('leases', `pods/${(body as any).metadata.name}`),
+        );
+      }
+      return request(method, path, body);
+    },
+  });
+  const pool = sandboxes.warmPool('agents');
+  await pool.reconcile(1);
+  const created = await pool.create(signal);
+  expect(created.fromPool).toBe(false);
+  expect(kinds.pods!.get(created.podName)?.metadata.deletionTimestamp).toBeUndefined();
+});

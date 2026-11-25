@@ -22,7 +22,7 @@ Four things make the scores: a warm pool, commands sent straight to the sandbox 
 
 | Suite                 | E2           | C4D          | Superserve | E2B      | Daytona  | Boat     | Best public |
 | --------------------- | ------------ | ------------ | ---------- | -------- | -------- | -------- | ----------- |
-| Burst TTI             | 71–79        | –            | 94         | 87       | 93       | 0        | 99          |
+| Burst TTI             | 74–89        | –            | 94         | 87       | 93       | 0        | 99          |
 | DAX (build)           | 43           | 73           | 71         | 48       | 60       | 9        | 80          |
 | Burst survival        | –            | 97           | 100        | 98       | 100      | 64       | 100         |
 | OS capabilities       | –            | 87           | 99         | 76       | 67       | 47       | 99          |
@@ -52,16 +52,17 @@ Burst TTI creates 100 sandboxes at once and runs `node -v` in each. A new pod ca
 
 **Every pod create, pod update and exec passes a GKE-managed admission webhook** on the control plane. In a burst each call took 0.7–1.7 s there, and requests queued behind them for about 2.8 s on average. A warm pool hands out a running sandbox by creating a Lease, which that webhook does not check, and `directCommands` sends the first command straight to the pod.
 
-We timed the released pool (0.6.0) from a pod in the cluster: 100 `pool.acquire` calls with new ids at once, from two replicas, each followed by `node -v`, all served from the pool.
+We timed the released pool (0.6.1) from a pod in the cluster: 100 `pool.acquire` calls with new ids at once, from two replicas, each followed by `node -v`, all served from the pool.
 
 | Run | Median | p95    | Worst  | Score |
 | --- | ------ | ------ | ------ | ----- |
-| 1   | 1.94 s | 4.24 s | 4.45 s | 71    |
-| 2   | 1.44 s | 3.81 s | 4.13 s | 76    |
-| 3   | 4.40 s | 4.85 s | 4.88 s | 54    |
-| 4   | 1.33 s | 3.30 s | 3.47 s | 79    |
+| 1   | 1.20 s | 1.47 s | 1.76 s | 87    |
+| 2   | 0.90 s | 1.29 s | 1.40 s | 89    |
+| 3   | 2.34 s | 3.04 s | 3.06 s | 74    |
 
-The score is ComputeSDK's formula (60% median, 25% p95, 15% p99, each against a 10 s ceiling), with the worst time standing in for p99. Run 3 was on a busier cluster. About 1.2 s of a hand-out in a burst is the lookup that decides whether the sandbox already exists: 100 lookups at once took 1.6 s.
+The score is ComputeSDK's formula (60% median, 25% p95, 15% p99, each against a 10 s ceiling), with the worst time standing in for p99. The hand-out alone took 0.6–0.9 s at the median in all three runs. In run 3 the first command was slow: 100 sandboxes starting `node` at once on a few nodes.
+
+A hand-out reads three lists to decide whether the sandbox already exists. Read from etcd, as a list is by default, each took 0.5–0.8 s in a burst; the library reads them from the API server's cache, once the cache has caught up with a read made during the call, at about 0.1 s each.
 
 ### Work inside the sandbox: the machine
 
@@ -135,6 +136,7 @@ The direct median rises from about 30 ms alone to about 220 ms with 100 at once.
 | Keep-alive through a Lease                                    | 0.4.1                                                               |
 | `directCommands`                                              | 0.5.0, off by default                                               |
 | Warm pool handed out with a Lease, under the caller's id      | 0.6.0                                                               |
+| Lists from the API server's cache                             | 0.6.1                                                               |
 | `snapshot`, `acquire(…, { from })`, `sleep(…, { now: true })` | 0.6.0                                                               |
 | `capabilities`, `snapshot_scope`, `pod_security_level`        | 0.6.0                                                               |
 | C4D machines                                                  | Terraform settings; see [deploy on C4D](../deploy.md#deploy-on-c4d) |

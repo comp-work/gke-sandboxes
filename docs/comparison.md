@@ -102,6 +102,10 @@ bun examples/benchmark-warm-pool.ts --endpoint "$ENDPOINT" --controller "$CONTRO
 
 **Keeping sandboxes ready.** A ready sandbox reserves its CPU and memory until a session claims it. Two were enough to serve bursts of two requests in our test. The quickstart creates sandboxes on demand. [Enable a warm pool](client.md#keep-sandboxes-ready-for-new-sessions)
 
+## ComputeSDK benchmark
+
+On the [ComputeSDK sandbox benchmark](https://www.computesdk.com/benchmarks/sandboxes/ratings), gke-sandboxes averages about 71 over 16 suites on E2 machines and about 77 on C4D. On the public table on November 24, 2026, the top provider had 83.8, E2B 73.7 and Daytona 69.1. [Results per suite, the settings each needs, and costs](benchmarks/computesdk-2026-11.md)
+
 ## When to choose a managed provider
 
 | If you need… | What to consider |

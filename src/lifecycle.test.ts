@@ -783,7 +783,7 @@ test('the first command after an acquire runs in its pod without looking it up',
   const ran: string[] = [];
   const sandboxes = backend({
     request: async (method, path, body) => {
-      if (method === 'GET' && path.includes('/pods?')) lookups += 1;
+      if (method === 'GET' && path.includes('/pods?labelSelector')) lookups += 1;
       return request(method, path, body);
     },
     exec: async (...call) => {
@@ -1038,14 +1038,16 @@ test("a warm pool hands out a sandbox under the caller's id, before its pod is l
   expect((await handedOut.sandbox.process.executeCommand('true')).exitCode).toBe(0);
 
   writes.resolve();
-  await Bun.sleep(10);
-  const { labels } = kinds.pods!.get(handedOut.podName)!.metadata;
-  expect(labels).toMatchObject({ team: 'blue', 'energy-sandbox': ID });
-  expect(POOL in labels).toBe(false);
-  expect(filesOf(ID).has(`${ID_FILE}=${ID}`)).toBe(true);
-
-  // It sleeps and wakes as the caller's sandbox, with its labels.
+  // The pod is labelled before its first snapshot, which carries the labels a wake finds it by.
+  const pod = kinds.pods!.get(handedOut.podName)!;
   await sandboxes.sleep(ID, { now: true });
+  expect(pod.metadata.labels).toMatchObject({ team: 'blue', 'energy-sandbox': ID });
+  expect(POOL in pod.metadata.labels).toBe(false);
+  expect(
+    [...kinds.podsnapshots!.values()].some(
+      ({ metadata }) => metadata.labels['energy-sandbox'] === ID,
+    ),
+  ).toBe(true);
   const woken = await pool.acquire(ID, signal);
   expect(woken).toMatchObject({ fromPool: false, startState: 'stopped' });
   expect(woken.labels).toMatchObject({ team: 'blue', 'energy-sandbox': ID });
@@ -1062,8 +1064,13 @@ test('callers that ask for the same new sandbox at the same moment get one pod',
   const replicas = [backend(), backend()];
   const pools = replicas.map((sandboxes) => sandboxes.warmPool('agents'));
   await pools[0]!.reconcile(4);
+  // The pods that are the sandbox: labelled as it, or named by its record before they are.
   const pods = (id: string) =>
-    [...kinds.pods!.values()].filter(({ metadata }) => metadata.labels['energy-sandbox'] === id);
+    [...kinds.pods!.values()].filter(
+      ({ metadata }) =>
+        metadata.labels['energy-sandbox'] === id ||
+        kinds.leases!.get(`${id}.sandbox`)?.spec?.holderIdentity === metadata.name,
+    );
 
   // Two pools.
   const both = await Promise.all(pools.map((pool) => pool.acquire('one', signal)));
@@ -1250,4 +1257,70 @@ test('a fork whose pod is lost before its first snapshot starts from its source 
   await sandboxes.acquire('fork-1', signal);
   expect(filesOf('fork-1').has('/home/notes=kept')).toBe(true);
   expect(filesOf('fork-1').has(`${ID_FILE}=fork-1`)).toBe(true);
+});
+
+test("a maintainer's Lease on a spare it removed stays until the pod is gone, then goes", async () => {
+  const { backend, kinds, linger, remove } = cluster({ drainStatus: 0, restores: true });
+  const pool = backend().warmPool('agents');
+  await pool.reconcile(1);
+  const [spare] = [...kinds.pods!.values()];
+  linger();
+  await pool.reconcile(0);
+  // The pod is shutting down and its Lease keeps every caller off it.
+  expect(kinds.pods!.get(spare!.metadata.name)?.metadata.deletionTimestamp).toBeTruthy();
+  expect(kinds.leases!.has(spare!.metadata.name)).toBe(true);
+  expect((await pool.acquire(ID, signal)).fromPool).toBe(false);
+  remove(spare!);
+  // Another sandbox's keep-alive, which names no pool, is no maintainer's to remove.
+  const { podName, touch } = await backend().acquire('other', signal);
+  await touch();
+  await pool.reconcile(0);
+  expect(kinds.leases!.has(spare!.metadata.name)).toBe(false);
+  expect(kinds.leases!.has(podName)).toBe(true);
+});
+
+test('a sandbox labelled or counted right after its hand-out is found by those labels', async () => {
+  const { backend, kinds } = cluster({ drainStatus: 0, restores: true });
+  const sandboxes = backend();
+  const pool = sandboxes.warmPool('agents');
+  await pool.reconcile(1);
+  const { podName } = await pool.acquire(ID, signal, { team: 'blue' });
+  expect((await sandboxes.inventory()).map(({ sandboxId, state }) => [sandboxId, state])).toEqual([
+    [ID, 'running'],
+  ]);
+  await sandboxes.labelPod(podName, { state: 'ready' });
+  expect(kinds.pods!.get(podName)!.metadata.labels).toMatchObject({
+    'energy-sandbox': ID,
+    team: 'blue',
+    state: 'ready',
+  });
+  expect((await sandboxes.list({ state: 'ready' })).map(({ name }) => name)).toEqual([ID]);
+});
+
+test('a spare deleted after the pool was listed is not handed out', async () => {
+  const { backend, request, kinds, linger } = cluster({ drainStatus: 0, restores: true });
+  const sandboxes = backend({
+    request: async (method, path, body) => {
+      // A node drain deletes the spare just as a caller takes it.
+      if (
+        method === 'POST' &&
+        path.endsWith('/leases') &&
+        !(body as any).metadata.name.includes('.')
+      ) {
+        linger();
+        await request(
+          'DELETE',
+          path
+            .replace('/apis/coordination.k8s.io/v1', '/api/v1')
+            .replace('leases', `pods/${(body as any).metadata.name}`),
+        );
+      }
+      return request(method, path, body);
+    },
+  });
+  const pool = sandboxes.warmPool('agents');
+  await pool.reconcile(1);
+  const created = await pool.create(signal);
+  expect(created.fromPool).toBe(false);
+  expect(kinds.pods!.get(created.podName)?.metadata.deletionTimestamp).toBeUndefined();
 });

@@ -19,6 +19,12 @@ const CLOSE = 255;
 const STDIN_CHUNK_BYTES = 256 * 1024;
 
 const GONE = 410;
+// The API server's answer when its cache did not reach a requested version in time.
+const TIMEOUT = 504;
+const CACHE_BEHIND_MS = 30_000;
+const ListVersionSchema = z.object({
+  metadata: z.object({ resourceVersion: z.string().optional() }).default({}),
+});
 const WatchedSchema = z.object({ metadata: z.object({ resourceVersion: z.string() }) });
 const WatchEventSchema = z.object({
   type: z.enum(['ADDED', 'MODIFIED', 'DELETED', 'BOOKMARK', 'ERROR']),
@@ -73,10 +79,65 @@ export const collectOutput = ({
 
 /** The few Kubernetes API calls sandboxes need: JSON resources, watches and exec. */
 export class KubernetesApi {
+  // Per collection: the read of its current version under way, and the one that callers arriving
+  // meanwhile will share once it ends. A read that started before a call could predate a write the
+  // caller just made.
+  private readonly versions = new Map<
+    string,
+    { current: Promise<string | undefined>; next: Promise<string | undefined> | undefined }
+  >();
+  // Collections whose cache fell behind, until when they are read as usual.
+  private readonly behind = new Map<string, number>();
+
   constructor(
     private readonly baseUrl: string,
     private readonly accessToken: () => Promise<string>,
   ) {}
+
+  private currentVersion(collection: string) {
+    const read = () => {
+      const current = this.request('GET', `${collection}?limit=1`).then(
+        (list) => ListVersionSchema.parse(list).metadata.resourceVersion,
+      );
+      const entry = { current, next: undefined as Promise<string | undefined> | undefined };
+      this.versions.set(collection, entry);
+      current
+        .finally(() => {
+          if (this.versions.get(collection) === entry && !entry.next)
+            this.versions.delete(collection);
+        })
+        .catch(() => undefined);
+      return current;
+    };
+    const entry = this.versions.get(collection);
+    if (!entry) return read();
+    entry.next ??= entry.current.catch(() => undefined).then(read);
+    return entry.next;
+  }
+
+  /**
+   * Lists a collection at least as fresh as a read that starts during the call, from the API
+   * server's cache. A list read as usual goes to etcd and filters every object there, which costs
+   * several times more and queues when many arrive at once. The current version comes from a
+   * one-item read, which callers arriving together share. `query` is the URL's query, with its
+   * `?`, or empty.
+   */
+  async list(collection: string, query: string): Promise<unknown> {
+    if ((this.behind.get(collection) ?? 0) > Date.now())
+      return this.request('GET', `${collection}${query}`);
+    const current = await this.currentVersion(collection);
+    if (!current) return this.request('GET', `${collection}${query}`);
+    const fresh = `resourceVersion=${current}&resourceVersionMatch=NotOlderThan`;
+    try {
+      return await this.request('GET', `${collection}${query ? `${query}&` : '?'}${fresh}`);
+    } catch (error) {
+      // The cache did not reach the version within the three seconds the server waits. It is not
+      // asked again for a while, so that lists do not each pay that wait.
+      if (!(error instanceof KubernetesApiError && error.status === TIMEOUT)) throw error;
+      this.behind.set(collection, Date.now() + CACHE_BEHIND_MS);
+      return this.request('GET', `${collection}${query}`);
+    }
+  }
 
   /**
    * Returns `null` for a missing resource and throws `KubernetesApiError` for other failures. A

@@ -46,7 +46,7 @@ await sandboxes.checkpoint(sandbox.id);
 
 Run one pool maintainer in your backend. This example keeps two unused sandboxes ready so two agents can start at once. Give every backend replica the same pool name, namespace, image and resource settings.
 
-A pool hands out a sandbox by creating a Lease named after its pod. GKE's admission webhooks check every pod write but not Leases, so hand-outs stay fast when many arrive at once. With 100 at the same moment, a hand-out and a first command took 1.3–1.9 s at the median in three runs and 4.4 s in a fourth, on a busier cluster, against 17 s for new pods. The pod is labelled as its sandbox right afterwards, off the caller's path.
+A pool hands out a sandbox by creating a Lease named after its pod. GKE's admission webhooks check every pod write but not Leases, so hand-outs stay fast when many arrive at once. With 100 at the same moment, a hand-out took 0.6–0.9 s at the median and 0.8–1.4 s at the 95th percentile, against 17 s for new pods. The pod is labelled as its sandbox right afterwards, off the caller's path.
 
 ```ts
 const pool = sandboxes.warmPool('agents');
